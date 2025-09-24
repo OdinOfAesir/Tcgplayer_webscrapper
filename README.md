@@ -62,5 +62,3 @@ Edit `configs/config.yaml` to customize:
 - **Utils**: Text parsing and Discord integration utilities
 - **Config**: YAML-based configuration with Python loader
 - **Scripts**: Main monitoring logic with clean imports
-
-This structure follows software engineering best practices with clear separation of concerns, making the codebase maintainable and extensible.
