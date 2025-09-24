@@ -6,15 +6,19 @@ Monitors specific card pages for recent sales and price history.
 import asyncio
 import json
 import logging
+import sys
 import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
-import requests
 
-from config import (
+# Add the project root to the Python path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from configs.config import (
     TCGPLAYER_PAGES_TO_MONITOR,
     MONITORING_INTERVAL_SECONDS,
     HEADLESS_MODE,
@@ -24,6 +28,15 @@ from config import (
     ALERT_ALL_NEW_SALES,
     DATA_FILE,
     LOG_FILE
+)
+
+from src.data_classes import LastSoldRecord
+from src.utils import (
+    extract_price_from_text,
+    extract_date_from_text,
+    extract_condition_from_text,
+    send_discord_alert,
+    send_startup_notification
 )
 
 # Configure logging
@@ -36,42 +49,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-
-class LastSoldRecord:
-    """Represents a last sold record."""
-    
-    def __init__(self, title: str, price: float, condition: str, sold_date: str, url: str):
-        self.title = title
-        self.price = price
-        self.condition = condition
-        self.sold_date = sold_date
-        self.url = url
-        self.timestamp = datetime.now()
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON storage."""
-        return {
-            'title': self.title,
-            'price': self.price,
-            'condition': self.condition,
-            'sold_date': self.sold_date,
-            'url': self.url,
-            'timestamp': self.timestamp.isoformat()
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'LastSoldRecord':
-        """Create from dictionary."""
-        record = cls(
-            title=data['title'],
-            price=data['price'],
-            condition=data['condition'],
-            sold_date=data['sold_date'],
-            url=data['url']
-        )
-        record.timestamp = datetime.fromisoformat(data['timestamp'])
-        return record
 
 
 class TCGPlayerLastSoldMonitor:
@@ -329,10 +306,10 @@ class TCGPlayerLastSoldMonitor:
                     row_text = await row.inner_text()
                     if row_text:
                         # Extract price, date, and condition from row text
-                        price = self.extract_price_from_text(row_text)
+                        price = extract_price_from_text(row_text)
                         if price > 0:
-                            date = self.extract_date_from_text(row_text)
-                            condition = self.extract_condition_from_text(row_text)
+                            date = extract_date_from_text(row_text)
+                            condition = extract_condition_from_text(row_text)
                             
                             record = LastSoldRecord(
                                 title=card_title,
@@ -359,10 +336,10 @@ class TCGPlayerLastSoldMonitor:
                 try:
                     text = await element.inner_text()
                     if text and any(keyword in text.lower() for keyword in ['last sold', 'recent sale', 'sold for', 'last sale', 'sold on']):
-                        price = self.extract_price_from_text(text)
+                        price = extract_price_from_text(text)
                         if price > 0:
-                            date = self.extract_date_from_text(text)
-                            condition = self.extract_condition_from_text(text)
+                            date = extract_date_from_text(text)
+                            condition = extract_condition_from_text(text)
                             
                             record = LastSoldRecord(
                                 title=card_title,
@@ -392,7 +369,7 @@ class TCGPlayerLastSoldMonitor:
                 # Get the SECOND element (index 1) - the most recent sale
                 second_element = elements[1]
                 text = await second_element.inner_text()
-                price = self.extract_price_from_text(text)
+                price = extract_price_from_text(text)
                 
                 if price > 0:
                     logger.info(f"✅ Found most recent sale price: ${price} (second element)")
@@ -403,7 +380,7 @@ class TCGPlayerLastSoldMonitor:
                 # Only one element found, use it
                 first_element = elements[0]
                 text = await first_element.inner_text()
-                price = self.extract_price_from_text(text)
+                price = extract_price_from_text(text)
                 
                 if price > 0:
                     logger.info(f"✅ Found price: ${price} (only one element found)")
@@ -430,7 +407,7 @@ class TCGPlayerLastSoldMonitor:
                 element = await page.query_selector(selector)
                 if element:
                     text = await element.inner_text()
-                    price = self.extract_price_from_text(text)
+                    price = extract_price_from_text(text)
                     if price > 0:
                         logger.info(f"✅ Found price using fallback selector: ${price} - {selector}")
                         return price
@@ -457,70 +434,13 @@ class TCGPlayerLastSoldMonitor:
                 element = await page.query_selector(selector)
                 if element:
                     text = await element.inner_text()
-                    price = self.extract_price_from_text(text)
+                    price = extract_price_from_text(text)
                     if price > 0:
                         return price
             except:
                 continue
         
         return 0.0
-    
-    def extract_price_from_text(self, text: str) -> float:
-        """Extract price from text."""
-        import re
-        # Look for price patterns like $123.45, $1,234.56, etc.
-        price_patterns = [
-            r'\$(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',  # $1,234.56
-            r'\$(\d+\.\d{2})',  # $123.45
-            r'\$(\d+)',  # $123
-        ]
-        
-        for pattern in price_patterns:
-            matches = re.findall(pattern, text)
-            if matches:
-                try:
-                    price_str = matches[0].replace(',', '')
-                    return float(price_str)
-                except:
-                    continue
-        
-        return 0.0
-    
-    def extract_date_from_text(self, text: str) -> str:
-        """Extract date from text."""
-        import re
-        # Look for date patterns
-        date_patterns = [
-            r'(\d{1,2}/\d{1,2}/\d{4})',  # MM/DD/YYYY
-            r'(\d{1,2}/\d{1,2}/\d{2})',  # MM/DD/YY
-            r'(\d{4}-\d{2}-\d{2})',  # YYYY-MM-DD
-            r'(\w+ \d{1,2}, \d{4})',  # Month DD, YYYY
-            r'(\d{1,2}/\d{1,2})',  # MM/DD (current year)
-            r'(\w+ \d{1,2})',  # Month DD (current year)
-        ]
-        
-        for pattern in date_patterns:
-            matches = re.findall(pattern, text)
-            if matches:
-                return matches[0]
-        
-        return "Unknown Date"
-    
-    def extract_condition_from_text(self, text: str) -> str:
-        """Extract condition from text."""
-        conditions = [
-            "Mint", "Near Mint", "Lightly Played", "Moderately Played", "Heavily Played", "Damaged",
-            "NM", "LP", "MP", "HP", "DMG",  # Abbreviations
-            "Japanese", "English",  # Language variants
-            "Foil", "Non-Foil", "Holo", "Non-Holo"  # Foil variants
-        ]
-        
-        text_lower = text.lower()
-        for condition in conditions:
-            if condition.lower() in text_lower:
-                return condition
-        
-        return "Unknown Condition"
     
     def compare_records(self, page_url: str, current_records: List[LastSoldRecord]) -> List[Dict[str, Any]]:
         """Compare current records with previous ones and return changes."""
@@ -544,71 +464,6 @@ class TCGPlayerLastSoldMonitor:
         
         return changes
     
-    async def send_discord_alert(self, message: str) -> None:
-        """Send alert to Discord webhook."""
-        if not DISCORD_WEBHOOK_URL:
-            return
-        
-        try:
-            payload = {
-                "content": message,
-                "username": "TCGPlayer Last Sold Monitor"
-            }
-            response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-            response.raise_for_status()
-            logger.info("Discord alert sent successfully")
-        except Exception as e:
-            logger.error(f"Failed to send Discord alert: {e}")
-    
-    async def send_startup_notification(self) -> None:
-        """Send startup notification to Discord."""
-        if not DISCORD_WEBHOOK_URL:
-            logger.info("No Discord webhook configured - skipping startup notification")
-            return
-        
-        try:
-            # Create a nice startup message
-            card_count = len(TCGPLAYER_PAGES_TO_MONITOR)
-            check_interval = MONITORING_INTERVAL_SECONDS // 60  # Convert to minutes
-            
-            # Extract card names from URLs for a cleaner message
-            card_names = []
-            for url in TCGPLAYER_PAGES_TO_MONITOR:
-                # Try to extract card name from URL
-                if 'product/' in url:
-                    parts = url.split('/')
-                    if len(parts) > 4:
-                        card_name = parts[4].replace('-', ' ').title()
-                        card_names.append(card_name)
-                    else:
-                        card_names.append("Unknown Card")
-                else:
-                    card_names.append("Unknown Card")
-            
-            # Create the startup message
-            startup_message = f"""🚀 **TCGPlayer Monitor Started!**
-
-📊 **Monitoring {card_count} cards:**
-{chr(10).join([f"• {name}" for name in card_names])}
-
-⏰ **Check interval:** Every {check_interval} minutes
-🔔 **Alerts:** New sales only
-📈 **Tracking:** Last sold prices
-
-✅ Ready to monitor! You'll get notified when new sales are detected."""
-            
-            payload = {
-                "content": startup_message,
-                "username": "TCGPlayer Last Sold Monitor"
-            }
-            
-            response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-            response.raise_for_status()
-            logger.info("Startup notification sent to Discord")
-            
-        except Exception as e:
-            logger.error(f"Failed to send startup notification: {e}")
-    
     async def monitor_pages(self) -> None:
         """Monitor all configured pages for last sold data."""
         logger.info(f"Starting to monitor {len(TCGPLAYER_PAGES_TO_MONITOR)} pages for last sold data")
@@ -623,7 +478,7 @@ class TCGPlayerLastSoldMonitor:
                     # Send alerts for changes
                     for change in changes:
                         logger.info(change['message'])
-                        await self.send_discord_alert(change['message'])
+                        send_discord_alert(change['message'], DISCORD_WEBHOOK_URL)
                     
                     # Update stored records
                     self.previous_records[page_url] = current_records
@@ -645,7 +500,7 @@ class TCGPlayerLastSoldMonitor:
             await self.start_browser()
             
             # Send startup notification to Discord
-            await self.send_startup_notification()
+            send_startup_notification(DISCORD_WEBHOOK_URL, TCGPLAYER_PAGES_TO_MONITOR, MONITORING_INTERVAL_SECONDS)
             
             while True:
                 start_time = time.time()
