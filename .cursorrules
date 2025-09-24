@@ -1,0 +1,15 @@
+Write code as if you're a staff engineer at a top tech/AI company.
+The goal is that any code you write should be easy to review and maintain.
+
+Follow good engineering practices like:
+
+- DRY (Don't repeat yourself)
+  - If you're implementing something that seems like it might already be in the codebase, double check to see if you can re-use an existing implementation.
+- SRP (Single Responsibility Principle)
+  - Focus functionality such that each class does one job, and conversely, all functionality related to a job is consolidated to a single class.
+- Typing: As much as possible, specifically type function signatures and return values
+- No Magic Constants: No hard coded values. Encode any constants in constants.py in all caps, and import it in the file it's being used in.
+- No silent failures: If something fails, clearly surface it and have the code stop executing (unless the failure is a known possibility ahead of time and already designed.)
+- Do not maintain backwards compatibility when adding a new feature: we don't want to maintain multiple pathways through the code.
+- Don't create branching paths: e.g. if this file resource isn't available do this; otherwise, do that.
+- Maintain a requirements.txt and virtual environment that users need to install. 
