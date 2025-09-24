@@ -5,7 +5,7 @@ Configuration for TCGPlayer card monitoring.
 # TCGPlayer URLs to monitor - add your specific card pages here
 TCGPLAYER_PAGES_TO_MONITOR = [
     # Example URLs - replace with your actual card pages
-    "https://www.tcgplayer.com/product/649586/pokemon-japan-m-p-promotional-cards-pikachu-020-m-p"
+    "https://www.tcgplayer.com/product/649586/pokemon-japan-m-p-promotional-cards-pikachu-020-m-p",
     "https://www.tcgplayer.com/product/593355/pokemon-sv-prismatic-evolutions-prismatic-evolutions-elite-trainer-box?page=1&Language=English",
     "https://www.tcgplayer.com/product/593466/pokemon-sv-prismatic-evolutions-prismatic-evolutions-surprise-box?page=1&Language=English",
     "https://www.tcgplayer.com/product/600518/pokemon-sv-prismatic-evolutions-prismatic-evolutions-booster-bundle?page=1&Language=English",
