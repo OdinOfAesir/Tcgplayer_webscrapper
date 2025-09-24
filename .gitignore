@@ -1,0 +1,46 @@
+# TCGPlayer Monitor - Git Ignore File
+
+# Data files (contain runtime data that changes frequently)
+card_data.json
+monitor.log
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Environment variables
+.env
+.env.local
+
+# Test files
+test_*.py
+*_test.py
+
+# Backup files
+*.bak
+*.backup
