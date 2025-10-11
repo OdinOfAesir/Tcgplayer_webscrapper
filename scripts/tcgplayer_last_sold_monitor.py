@@ -525,6 +525,19 @@ async def main():
     """Main entry point."""
     monitor = TCGPlayerLastSoldMonitor()
     await monitor.run_monitoring_loop()
+# --- add this in scripts/tcgplayer_last_sold_monitor.py ---
+
+def fetch_last_sold_once(url: str) -> dict:
+    """
+    TEMPORARY stub so the Render deploy works.
+    Replace this with real scraping logic later,
+    or call into existing utilities here.
+    """
+    return {
+        "url": url,
+        "most_recent_sale": None,
+        "note": "stub fetch_last_sold_once is wired; implement real scrape next"
+    }
 
 
 if __name__ == "__main__":
