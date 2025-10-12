@@ -1,8 +1,14 @@
 # scripts/one_shot.py
-# - Logs in if env creds provided (TCG_EMAIL / TCG_PASSWORD), saves session to /app/state.json
-# - fetch_last_sold_once(url): prior single-price scrape
-# - fetch_sales_snapshot(url): opens "Sales History Snapshot" dialog and returns tables+stats+text
-# - Robust timeouts/retries + artifacts (screenshot/html) saved under /app/debug on failure
+# Robust one-shot scrapers:
+#  - fetch_last_sold_once(url)
+#  - fetch_sales_snapshot(url): opens "Sales History Snapshot" dialog and returns tables + stats + text
+#
+# Improvements:
+#  * Force-scroll to lazy-load "Latest Sales" section
+#  * More click strategies (hover, normal click, JS click, keypress)
+#  * Accept multiple dialog forms (role, aria-modal, common modal classes)
+#  * Save artifacts BEFORE waiting on role/text so you always get debug files
+#  * Clear JSON errors with reasons + artifact paths
 
 import os
 import re
@@ -28,8 +34,8 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
-NAV_TIMEOUT_MS   = _env_int("TIMEOUT_MS", 60000)       # navigation (goto/load)
-SNAPSHOT_WAIT_MS = _env_int("SNAPSHOT_WAIT_MS", 30000) # dialog wait
+NAV_TIMEOUT_MS   = _env_int("TIMEOUT_MS", 60000)        # navigation (goto/load)
+SNAPSHOT_WAIT_MS = _env_int("SNAPSHOT_WAIT_MS", 45000)  # dialog wait
 RETRY_TIMES      = _env_int("RETRY_TIMES", 3)
 DEBUG            = (os.getenv("DEBUG") == "1")
 
@@ -168,6 +174,21 @@ def _goto_with_retries(page: Page, url: str) -> None:
             page.wait_for_timeout(500 * (attempt + 1))
     raise last_err if last_err else RuntimeError("navigation failed")
 
+def _slow_scroll(page: Page, steps: int = 12):
+    """Gradually scroll to bottom to trigger lazy-loading."""
+    try:
+        total = page.evaluate("() => document.body.scrollHeight")
+        y = 0
+        for i in range(steps):
+            y = int(total * (i + 1) / steps)
+            page.evaluate("(yy) => window.scrollTo(0, yy)", y)
+            page.wait_for_timeout(350)
+        # scroll back a bit so header area re-enters viewport cleanly
+        page.evaluate("() => window.scrollBy(0, -300)")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
 # -----------------------------
 # Public: last sold
 # -----------------------------
@@ -275,62 +296,96 @@ def _extract_key_values_from_dialog_html(html: str) -> List[Dict[str, str]]:
     return out
 
 def _open_snapshot_dialog(page: Page, wait_ms: int) -> None:
-    """Click the 'Sales History Snapshot' (history) control and wait for the dialog."""
+    """Open the Sales History dialog with robust strategies."""
+    # 1) Ensure the Latest Sales area is actually in the DOM (lazy-loaded)
+    _slow_scroll(page, steps=14)  # triggers client-side rendering
+
+    # 2) Try to focus the history header area
     try:
         page.locator(".latest-sales__header__history").first.scroll_into_view_if_needed(timeout=1500)
     except Exception:
         pass
 
-    clicked = False
-    for sel in [
+    # 3) Try several click methods
+    selectors = [
         ".latest-sales__header__history button",
         ".latest-sales__header__history",
         'button:has-text("History")',
         'button[aria-label*="History"]',
         'button:has-text("Sales History")',
         '[data-testid*="history"]',
-    ]:
+        'xpath=//button[.//text()[contains(., "History")]]'
+    ]
+    clicked = False
+    for sel in selectors:
         try:
             loc = page.locator(sel).first
             if loc and loc.is_visible():
-                try: loc.hover(timeout=1000)
+                try: loc.hover(timeout=800)
                 except Exception: pass
-                loc.click(timeout=2500)
+                loc.click(timeout=2000)
                 clicked = True
                 break
         except Exception:
             pass
 
     if not clicked:
+        # JS click on the container (catches SVG/icon overlays)
         try:
-            page.evaluate("(sel)=>{const el=document.querySelector(sel); if(el){ el.click(); return true } return false }",
-                          ".latest-sales__header__history")
-            clicked = True
+            ok = page.evaluate("(sel)=>{const el=document.querySelector(sel); if(el){ el.click(); return true } return false }",
+                               ".latest-sales__header__history")
+            if ok:
+                clicked = True
         except Exception:
             pass
 
-    # Waits
-    if clicked:
+    if not clicked:
+        # Keyboard activation on focused element in the area
         try:
-            page.get_by_role("dialog", name=re.compile(r"Sales\\s+History\\s+Snapshot", re.I)).first.wait_for(timeout=wait_ms)
-            return
+            h = page.locator(".latest-sales__header__history").first
+            if h:
+                h.focus()
+                page.keyboard.press("Enter")
+                clicked = True
         except Exception:
             pass
+
+    # 4) Immediately save an artifact of the state *after* clicking
+    _save_debug(page, "after-click-history")
+
+    # 5) Wait for dialog in multiple ways (short polls up to wait_ms)
+    deadline = time.time() + (wait_ms / 1000.0)
+    while time.time() < deadline:
         try:
-            page.locator('text=/Sales\\s+History\\s+Snapshot/i').first.wait_for(timeout=wait_ms)
-            return
+            dlg = page.get_by_role("dialog", name=re.compile(r"Sales\\s+History\\s+Snapshot", re.I)).first
+            if dlg and dlg.is_visible():
+                return
         except Exception:
             pass
-        for sel in ['[role="dialog"]', '.modal', '.MuiDialog-paper', '.chakra-modal__content', '[class*="dialog"]', '[class*="modal"]']:
+        # any modal-ish container visible?
+        for sel in ['[role="dialog"]', '[aria-modal="true"]', '.modal', '.MuiDialog-paper', '.chakra-modal__content', '[class*="dialog"]', '[class*="modal"]']:
             try:
-                if page.locator(sel).first.is_visible():
+                loc = page.locator(sel).first
+                if loc and loc.is_visible():
                     return
             except Exception:
                 pass
+        # title text somewhere?
+        try:
+            if page.locator('text=/Sales\\s+History\\s+Snapshot/i').first.is_visible():
+                return
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
 
     raise TimeoutError("Sales History Snapshot dialog not found")
 
 def fetch_sales_snapshot(url: str) -> dict:
+    """
+    Navigate to product page, open Sales History Snapshot dialog,
+    parse all tables + key-values + top-level text into JSON.
+    Always returns a dict; on failure includes 'error' and debug artifact paths.
+    """
     t0 = time.time()
     with sync_playwright() as p:
         browser, context = _new_context(p, use_saved_state=True)
@@ -374,34 +429,36 @@ def fetch_sales_snapshot(url: str) -> dict:
                     "elapsed_ms": int((time.time() - t0) * 1000),
                 }
 
-            # Identify dialog root
+            # Identify dialog root (accept any visible modal)
             dialog = None
-            try:
-                dialog = page.get_by_role("dialog", name=re.compile(r"Sales\\s+History\\s+Snapshot", re.I)).first
-                dialog.wait_for(timeout=2000)
-            except Exception:
-                pass
+            for sel in [
+                'role=dialog[name=/Sales\\s+History\\s+Snapshot/i]',
+                '[role="dialog"]',
+                '[aria-modal="true"]',
+                '.modal', '.MuiDialog-paper', '.chakra-modal__content',
+                '[class*="dialog"]', '[class*="modal"]'
+            ]:
+                try:
+                    loc = page.locator(sel).first if not sel.startswith('role=') else page.get_by_role("dialog", name=re.compile(r"Sales\\s+History\\s+Snapshot", re.I)).first
+                    if loc and loc.is_visible():
+                        dialog = loc
+                        break
+                except Exception:
+                    pass
 
             if dialog:
                 dialog_html = dialog.inner_html()
                 dialog_text = dialog.inner_text()
                 title = "Sales History Snapshot"
             else:
-                possible = page.locator(
-                    '[role="dialog"], .modal, .MuiDialog-paper, .chakra-modal__content, [class*="dialog"], [class*="modal"]'
-                ).first
-                if possible and possible.is_visible():
-                    dialog_html = possible.inner_html()
-                    dialog_text = possible.inner_text()
-                    title = "Sales History Snapshot"
-                else:
-                    art = _save_debug(page, "dialog-missing-after-open")
-                    return {
-                        "url": url, "title": None, "tables": [], "stats": [], "text": None,
-                        "error": "dialog_not_found_after_open", "artifacts": art,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "elapsed_ms": int((time.time() - t0) * 1000),
-                    }
+                # As a last resort, capture whole page so you can inspect
+                art = _save_debug(page, "dialog-missing-after-open")
+                return {
+                    "url": url, "title": None, "tables": [], "stats": [], "text": None,
+                    "error": "dialog_not_found_after_open", "artifacts": art,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "elapsed_ms": int((time.time() - t0) * 1000),
+                }
 
             tables = _extract_tables_from_dialog_html(dialog_html)
             stats  = _extract_key_values_from_dialog_html(dialog_html)
