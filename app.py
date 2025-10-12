@@ -14,18 +14,15 @@ from scripts.one_shot import (
     debug_visit,
     debug_trace,
     debug_myaccount,
-    debug_js,
+    debug_js,  # make sure this exists in scripts/one_shot.py
 )
 
-app = FastAPI(title="tcgplayer-scraper", version="1.3.0")
+app = FastAPI(title="tcgplayer-scraper", version="1.3.1")
 
-# ---- CORS (allow your Base44 domains to call this API from the browser) ----
-# Set ALLOWED_ORIGINS env to a comma-separated list, e.g.:
-# https://app.base44.com,https://yourdomain.com
+# ---- CORS ----
 ALLOWED_ORIGINS = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "").split(",") if o.strip()]
 if not ALLOWED_ORIGINS:
-    # fallback for testing; you should set ALLOWED_ORIGINS in Render
-    ALLOWED_ORIGINS = ["*"]
+    ALLOWED_ORIGINS = ["*"]  # dev fallback; set ALLOWED_ORIGINS in Render
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,17 +32,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Simple API-key gate (protects your endpoints) ----
-API_KEY = os.getenv("API_KEY")  # set in Render → Environment
+# ---- Simple API key gate ----
+API_KEY = os.getenv("API_KEY")
 def _auth(x_api_key: str | None) -> None:
     if not API_KEY:
-        return  # no key configured -> no auth (not recommended)
+        return
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "tcgplayer-scraper", "version": "1.3.0"}
+    return {"ok": True, "service": "tcgplayer-scraper", "version": "1.3.1"}
 
 # ---- Public API ----
 
@@ -65,41 +62,49 @@ def sales_snapshot(payload: dict, x_api_key: str | None = Header(default=None, c
         raise HTTPException(status_code=400, detail="Missing url")
     return JSONResponse(fetch_sales_snapshot(url))
 
-# ---- Debug / Diagnostics (consider gating these with API_KEY or disabling in prod) ----
+# ---- Debug / Diagnostics ----
 
 @app.post("/debug/login")
 def debug_login(x_api_key: str | None = Header(default=None, convert_underscores=False)):
-    _auth(x_api_key);  return JSONResponse(debug_login_only())
+    _auth(x_api_key)
+    return JSONResponse(debug_login_only())
 
 @app.get("/debug/proxy-ip")
 def _proxy_ip(x_api_key: str | None = Header(default=None, convert_underscores=False)):
-    _auth(x_api_key);  return JSONResponse(debug_proxy_ip())
+    _auth(x_api_key)
+    return JSONResponse(debug_proxy_ip())
 
 @app.get("/debug/cookies")
 def _cookies(x_api_key: str | None = Header(default=None, convert_underscores=False)):
-    _auth(x_api_key);  return JSONResponse(debug_cookies())
+    _auth(x_api_key)
+    return JSONResponse(debug_cookies())
 
 @app.get("/debug/localstorage")
 def _localstorage(x_api_key: str | None = Header(default=None, convert_underscores=False)):
-    _auth(x_api_key);  return JSONResponse(debug_localstorage())
+    _auth(x_api_key)
+    return JSONResponse(debug_localstorage())
 
 @app.get("/debug/visit")
 def _visit(url: str, x_api_key: str | None = Header(default=None, convert_underscores=False)):
-    _auth(x_api_key);  return JSONResponse(debug_visit(url))
+    _auth(x_api_key)
+    return JSONResponse(debug_visit(url))
 
 @app.get("/debug/trace")
 def _trace(url: str, x_api_key: str | None = Header(default=None, convert_underscores=False)):
-    _auth(x_api_key);  return JSONResponse(debug_trace(url))
+    _auth(x_api_key)
+    return JSONResponse(debug_trace(url))
 
 @app.get("/debug/myaccount")
 def _myaccount(x_api_key: str | None = Header(default=None, convert_underscores=False)):
-    _auth(x_api_key);  return JSONResponse(debug_myaccount())
+    _auth(x_api_key)
+    return JSONResponse(debug_myaccount())
 
 @app.get("/debug/js")
 def _js(x_api_key: str | None = Header(default=None, convert_underscores=False)):
-    _auth(x_api_key);  return JSONResponse(debug_js())
+    _auth(x_api_key)
+    return JSONResponse(debug_js())
 
-# Simple file server for artifacts under /app/debug
+# Artifact downloader
 @app.get("/debug/artifact")
 def artifact(path: str, x_api_key: str | None = Header(default=None, convert_underscores=False)):
     _auth(x_api_key)
