@@ -1,13 +1,13 @@
 # scripts/one_shot.py
 # End-to-end Playwright helpers for your FastAPI service.
-# Features:
+# Proxy-ready version:
+#   - Parse HTTP_PROXY/HTTPS_PROXY and pass username/password properly to Playwright
 #   - Load logged-in storage state from STATE_B64 env → /app/state.json
 #   - Optional state-only mode (FORCE_STATE_ONLY=1) to avoid CAPTCHA-triggering logins
 #   - Honors USER_AGENT env to match the UA used when you captured state.json
 #   - debug_login_only(): verifies session and captures BEFORE/AFTER artifacts
 #   - fetch_last_sold_once(url): extracts "Most Recent Sale"/"Last Sold"
 #   - fetch_sales_snapshot(url): opens "Sales History Snapshot" dialog and returns tables + key/values + text
-#   - Robust navigation, timeouts, retries, artifact capture on failure
 
 import os
 import re
@@ -18,6 +18,7 @@ import uuid
 import json
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page
@@ -63,8 +64,32 @@ USER_AGENT       = os.getenv("USER_AGENT") or (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Optional: HTTP proxy for requests (e.g., http://user:pass@host:port)
-HTTP_PROXY = os.getenv("HTTP_PROXY")  # leave unset unless you really need it
+# -------------------------------------------------------------------
+# Proxy parsing (supports creds)
+# -------------------------------------------------------------------
+def _parse_proxy_env():
+    """
+    Read HTTP_PROXY or HTTPS_PROXY env and return a Playwright proxy dict or None.
+    Accepts forms like:
+      - http://user:pass@host:port
+      - https://host:port
+      - socks5://user:pass@host:port
+      - host:port   (scheme assumed http)
+    """
+    raw = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+    if not raw:
+        return None
+    u = urlparse(raw if "://" in raw else f"http://{raw}")
+    if not u.hostname or not u.port:
+        print("[proxy] invalid proxy URL:", raw)
+        return None
+    proxy = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username:
+        proxy["username"] = u.username
+    if u.password:
+        proxy["password"] = u.password
+    print("[proxy] using", proxy["server"], "auth=" + ("yes" if "username" in proxy else "no"))
+    return proxy
 
 # -------------------------------------------------------------------
 # Utilities & artifact helpers
@@ -130,14 +155,9 @@ def _click_consent_if_present(page: Page):
 
 def _new_context(p, use_saved_state: bool):
     storage_state_path = STATE_PATH if (use_saved_state and pathlib.Path(STATE_PATH).exists()) else None
-    # Launch Chromium
-    launch_args = ["--no-sandbox"]
-    if HTTP_PROXY:
-        # Playwright uses proxy per-context; keep arg for completeness if your proxy requires it
-        pass
-    browser = p.chromium.launch(headless=True, args=launch_args)
+    proxy_cfg = _parse_proxy_env()
 
-    # Create context with stable hints + UA
+    browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
     context = browser.new_context(
         viewport={"width": 1366, "height": 900},
         locale="en-US",
@@ -147,12 +167,9 @@ def _new_context(p, use_saved_state: bool):
         device_scale_factor=1.0,
         is_mobile=False,
         has_touch=False,
-        proxy={"server": HTTP_PROXY} if HTTP_PROXY else None,
+        proxy=proxy_cfg,  # credentials included if provided
     )
-    # Extra headers help mimic real Chrome
-    context.set_extra_http_headers({
-        "Accept-Language": "en-US,en;q=0.9",
-    })
+    context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
     return browser, context
 
 def _anti_bot_check(page: Page) -> Optional[str]:
