@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 pydantic
-playwright
 beautifulsoup4
 lxml
+# (omit 'playwright' here)
