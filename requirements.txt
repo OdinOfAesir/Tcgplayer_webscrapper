@@ -3,4 +3,4 @@ uvicorn
 pydantic
 beautifulsoup4
 lxml
-# (omit 'playwright' here)
+playwright==1.55.0
