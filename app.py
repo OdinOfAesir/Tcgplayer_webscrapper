@@ -47,3 +47,21 @@ def sales_snapshot(req: Req):
     except Exception as e:
         logger.exception("sales-snapshot failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+from fastapi.responses import FileResponse
+import glob, os
+
+@app.get("/debug/last-screenshot")
+def last_screenshot():
+    files = sorted(glob.glob("/app/debug/*.png"))
+    if not files:
+        raise HTTPException(status_code=404, detail="no screenshots")
+    return FileResponse(files[-1], media_type="image/png")
+
+@app.get("/debug/last-html")
+def last_html():
+    files = sorted(glob.glob("/app/debug/*.html"))
+    if not files:
+        raise HTTPException(status_code=404, detail="no html")
+    return FileResponse(files[-1], media_type="text/html")
+
