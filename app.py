@@ -12,13 +12,14 @@ from scripts.one_shot import (
     debug_localstorage,
     debug_visit,
     debug_trace,
+    debug_myaccount,
 )
 
-app = FastAPI(title="tcgplayer-scraper", version="1.0.0")
+app = FastAPI(title="tcgplayer-scraper", version="1.1.0")
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "tcgplayer-scraper", "version": "1.0.0"}
+    return {"ok": True, "service": "tcgplayer-scraper", "version": "1.1.0"}
 
 # ---- Public API ----
 
@@ -62,11 +63,12 @@ def _visit(url: str):
 def _trace(url: str):
     return JSONResponse(debug_trace(url))
 
-# simple file server for artifacts under /app/debug
+@app.get("/debug/myaccount")
+def _myaccount():
+    return JSONResponse(debug_myaccount())
+
+# Simple file server for artifacts under /app/debug
 @app.get("/debug/artifact")
 def artifact(path: str):
     if not path.startswith("/app/debug/"):
-        raise HTTPException(status_code=400, detail="invalid path")
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="not found")
-    return FileResponse(path)
+        raise HTTPException(status_code=400, detail="invalid path")_
