@@ -9,6 +9,27 @@
 #  * Smarter consent handling, scrolling, and multiple selector strategies
 #  * Clear error payloads instead of generic timeouts
 
+import uuid
+DEBUG_DIR = "/app/debug"
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+def _save_debug(page, tag: str):
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    uid = uuid.uuid4().hex[:8]
+    base = f"{DEBUG_DIR}/{tag}-{ts}-{uid}"
+    try:
+        page.screenshot(path=f"{base}.png", full_page=True)
+    except Exception:
+        pass
+    try:
+        html = page.content()
+        with open(f"{base}.html", "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception:
+        pass
+    return {"screenshot": f"{base}.png", "html": f"{base}.html"}
+
 import os
 import re
 import time
@@ -191,14 +212,15 @@ def fetch_last_sold_once(url: str) -> dict:
         try:
             _goto_with_retries(page, url)
             _click_consent_if_present(page)
+        except Exception as e:
+            art = _save_debug(page, "nav-failed")
+            return {
+                "url": url, "error": "timeout_nav", "reason": str(e),
+                "artifacts": art,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "elapsed_ms": int((time.time() - t0) * 1000),
+            }
 
-            err = _anti_bot_check(page)
-            if err:
-                return {
-                    "url": url, "most_recent_sale": None, "error": err,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "elapsed_ms": int((time.time() - t0) * 1000),
-                }
 
             html = page.content()
             price = _extract_recent_sale_from_html(html)
@@ -361,18 +383,26 @@ def fetch_sales_snapshot(url: str) -> dict:
         try:
             _goto_with_retries(page, url)
             _click_consent_if_present(page)
+        except Exception as e:
+            art = _save_debug(page, "nav-failed")
+            return {
+                "url": url, "error": "timeout_nav", "reason": str(e),
+                "artifacts": art,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "elapsed_ms": int((time.time() - t0) * 1000),
+            }
 
-            err = _anti_bot_check(page)
-            if err:
+            # Open the dialog (with retries)
+            try:
+                _open_snapshot_dialog(page)
+            except Exception as e:
+                art = _save_debug(page, "dialog-failed")
                 return {
-                    "url": url, "title": None, "tables": [], "stats": [], "text": None,
-                    "error": err,
+                    "url": url, "error": "timeout_dialog", "reason": str(e),
+                    "artifacts": art,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "elapsed_ms": int((time.time() - t0) * 1000),
                 }
-
-            # Open the dialog (with retries)
-            _open_snapshot_dialog(page)
 
             # Prefer role-based dialog; else fallback to typical modal containers
             dialog = None
