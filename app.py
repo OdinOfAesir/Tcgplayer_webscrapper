@@ -70,5 +70,9 @@ def _myaccount():
 # Simple file server for artifacts under /app/debug
 @app.get("/debug/artifact")
 def artifact(path: str):
+    # only allow files under /app/debug
     if not path.startswith("/app/debug/"):
-        raise HTTPException(status_code=400, detail="invalid path")_
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path)
