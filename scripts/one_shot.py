@@ -9,6 +9,19 @@
 #  * Smarter consent handling, scrolling, and multiple selector strategies
 #  * Clear error payloads instead of generic timeouts
 
+# scripts/one_shot.py
+
+import os          # <-- add this
+import re
+import time
+import base64
+import pathlib
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
+
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page
+
 import uuid
 DEBUG_DIR = "/app/debug"
 os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -29,18 +42,6 @@ def _save_debug(page, tag: str):
     except Exception:
         pass
     return {"screenshot": f"{base}.png", "html": f"{base}.html"}
-
-import os
-import re
-import time
-import base64
-import pathlib
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
-
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page
-
 
 STATE_PATH = "/app/state.json"  # persisted session cookies (inside container FS)
 
