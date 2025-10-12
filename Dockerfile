@@ -1,15 +1,20 @@
-# Dockerfile
-# Match Playwright 1.55.0 as requested by the runtime
+# Dockerfile — keeps Playwright + browsers preinstalled and version-matched
 FROM mcr.microsoft.com/playwright/python:v1.55.0-jammy
 
 WORKDIR /app
 
-# Install Python deps (do NOT force-install 'playwright' here)
+# Silence root pip warning (harmless in containers)
+ENV PIP_ROOT_USER_ACTION=ignore
+
+# Install Python deps
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy the app
+# Copy your app after deps (better cache)
 COPY . /app
 
-# Use $PORT provided by Render (JSON CMD won’t expand $PORT, so use a shell)
+# Make logs unbuffered
+ENV PYTHONUNBUFFERED=1
+
+# Use Render's $PORT at runtime (shell to expand env)
 CMD ["/bin/sh", "-c", "uvicorn app:app --host 0.0.0.0 --port $PORT"]
