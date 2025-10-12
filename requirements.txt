@@ -1,6 +1,7 @@
-fastapi
-uvicorn
-pydantic
-beautifulsoup4
-lxml
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.6.0
+beautifulsoup4>=4.12.3
+lxml>=5.2.1
+# Keep this version MATCHED to the Docker image tag above
 playwright==1.55.0
