@@ -1,12 +1,4 @@
 # scripts/one_shot.py
-# Proxy-ready Playwright helpers for FastAPI.
-# - Parses HTTP(S)/SOCKS proxy env (with username/password) and applies to Playwright context
-# - Loads logged-in storage state from STATE_B64 -> /app/state.json
-# - FORCE_STATE_ONLY=1 prevents password login (avoids CAPTCHA)
-# - USER_AGENT + fingerprint spoof (platform, languages, no webdriver)
-# - Scrapers: fetch_last_sold_once, fetch_sales_snapshot
-# - Debug helpers: login check, proxy IP, cookies, localStorage, visit (artifacts), trace, myaccount probe
-
 import os
 import re
 import time
@@ -21,18 +13,17 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page
 
-# ---------- constants & boot hydration ----------
 STATE_PATH = "/app/state.json"
 DEBUG_DIR  = "/app/debug"
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
-# write /app/state.json from STATE_B64 at boot if missing
+# Hydrate /app/state.json from STATE_B64 if missing
 if not pathlib.Path(STATE_PATH).exists():
     _b64 = os.getenv("STATE_B64")
     if _b64:
         try:
             data = base64.b64decode(_b64.encode("ascii"))
-            _ = json.loads(data.decode("utf-8"))  # sanity check
+            _ = json.loads(data.decode("utf-8"))
             with open(STATE_PATH, "wb") as f:
                 f.write(data)
             print("[boot] wrote storage state from STATE_B64")
@@ -49,25 +40,16 @@ def _env_int(name: str, default: int) -> int:
 NAV_TIMEOUT_MS   = _env_int("TIMEOUT_MS", 60000)
 SNAPSHOT_WAIT_MS = _env_int("SNAPSHOT_WAIT_MS", 45000)
 RETRY_TIMES      = _env_int("RETRY_TIMES", 3)
-DEBUG            = (os.getenv("DEBUG") == "1")
 FORCE_STATE_ONLY = (os.getenv("FORCE_STATE_ONLY") == "1")
 USER_AGENT       = os.getenv("USER_AGENT") or (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
-# New: fingerprint knobs (match your real desktop used to capture state)
 NAV_PLATFORM = os.getenv("NAV_PLATFORM", "MacIntel")
 NAV_LANGS    = os.getenv("NAV_LANGS", "en-US,en")
 
-# ---------- proxy parsing ----------
+# ---------- proxy ----------
 def _parse_proxy_env():
-    """
-    Accept:
-      - http://user:pass@host:port
-      - https://host:port
-      - socks5://user:pass@host:port
-      - host:port  (assumes http)
-    """
     raw = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
     if not raw:
         return None
@@ -83,7 +65,7 @@ def _parse_proxy_env():
     print("[proxy] using", proxy["server"], "auth=" + ("yes" if "username" in proxy else "no"))
     return proxy
 
-# ---------- utils ----------
+# ---------- helpers ----------
 def _save_debug(page: Page, tag: str) -> Dict[str, str]:
     ts  = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     uid = uuid.uuid4().hex[:8]
@@ -156,11 +138,11 @@ def _new_context(p, use_saved_state: bool):
         device_scale_factor=1.0,
         is_mobile=False,
         has_touch=False,
+        java_script_enabled=True,
         proxy=proxy_cfg,
     )
-    # Headers
     context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
-    # Fingerprint: navigator.* + remove webdriver + add window.chrome
+    # Fingerprint
     langs_js = "[" + ",".join([f"'{x.strip()}'" for x in NAV_LANGS.split(",") if x.strip()]) + "]"
     context.add_init_script(f"""
         Object.defineProperty(navigator, 'platform', {{ get: () => '{NAV_PLATFORM}' }});
@@ -204,7 +186,7 @@ def _slow_scroll(page: Page, steps: int = 14):
     except Exception:
         pass
 
-# ---------- login helpers ----------
+# ---------- login ----------
 def _is_logged_in(page: Page) -> bool:
     try:
         if "/login" in (page.url or "").lower():
@@ -247,14 +229,13 @@ def _do_login_flow(context, capture=True) -> Dict[str, Any]:
         if capture:
             before_paths = _save_debug(page, "login-before")
 
-        # email
         filled_email = False
         for sel in ['input[name="email"]', 'input[type="email"]', '#email', 'input[autocomplete="username"]']:
             try:
                 page.fill(sel, email, timeout=4000); filled_email = True; break
             except PWTimeout:
                 pass
-        # password
+
         filled_pass = False
         for sel in ['input[name="password"]', 'input[type="password"]', '#password', 'input[autocomplete="current-password"]']:
             try:
@@ -266,14 +247,8 @@ def _do_login_flow(context, capture=True) -> Dict[str, Any]:
             if capture: after_paths = _save_debug(page, "login-after")
             return {"ok": False, "error": "selectors_not_found", "before": before_paths, "after": after_paths}
 
-        # submit
         clicked = False
-        for sel in [
-            'button[type="submit"]',
-            'button:has-text("Sign In")',
-            'button:has-text("Log In")',
-            'button:has-text("Sign in")',
-        ]:
+        for sel in ['button[type="submit"]','button:has-text("Sign In")','button:has-text("Log In")','button:has-text("Sign in")']:
             try:
                 page.click(sel, timeout=4000); clicked = True; break
             except PWTimeout:
@@ -282,7 +257,6 @@ def _do_login_flow(context, capture=True) -> Dict[str, Any]:
             try: page.keyboard.press("Enter")
             except Exception: pass
 
-        # wait & verify
         page.wait_for_timeout(1500)
         success = False
         for _ in range(12):
@@ -302,7 +276,6 @@ def _do_login_flow(context, capture=True) -> Dict[str, Any]:
         page.close()
 
 def _ensure_logged_in(context) -> Dict[str, Any]:
-    # try with saved state
     page = context.new_page()
     try:
         page.goto("https://www.tcgplayer.com/", wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
@@ -322,12 +295,8 @@ def _ensure_logged_in(context) -> Dict[str, Any]:
 
     return {"ok": False, "error": "no_valid_state_and_no_creds"}
 
-# ---------- DEBUG: login-only state verification ----------
+# ---------- debug: login state-only ----------
 def debug_login_only() -> Dict[str, Any]:
-    """
-    Verify if current storage state (and proxy/UA) produce a logged-in homepage.
-    If FORCE_STATE_ONLY=1 and not logged in, we don't attempt password login.
-    """
     t0 = time.time()
     with sync_playwright() as p:
         browser, context = _new_context(p, use_saved_state=True)
@@ -340,46 +309,27 @@ def debug_login_only() -> Dict[str, Any]:
 
                 if _is_logged_in(page):
                     after = _save_debug(page, "login-state-check-after")
-                    return {
-                        "ok": True,
-                        "mode": "state_only_check",
-                        "before": before,
-                        "after": after,
-                        "elapsed_ms": int((time.time() - t0) * 1000),
-                        "state_path": STATE_PATH,
-                    }
+                    return {"ok": True, "mode": "state_only_check", "before": before, "after": after,
+                            "elapsed_ms": int((time.time() - t0) * 1000), "state_path": STATE_PATH}
 
-                # Not logged in using state
                 if FORCE_STATE_ONLY:
                     after = _save_debug(page, "login-state-check-after")
-                    return {
-                        "ok": False,
-                        "mode": "state_only_check",
-                        "error": "not_logged_in_with_state",
-                        "before": before,
-                        "after": after,
-                        "elapsed_ms": int((time.time() - t0) * 1000),
-                    }
-
+                    return {"ok": False, "mode": "state_only_check", "error": "not_logged_in_with_state",
+                            "before": before, "after": after, "elapsed_ms": int((time.time() - t0) * 1000)}
             finally:
                 page.close()
 
-            # Try password login only if allowed and creds exist
             if not FORCE_STATE_ONLY and os.getenv("TCG_EMAIL") and os.getenv("TCG_PASSWORD"):
                 result = _do_login_flow(context, capture=True)
                 result.update({"elapsed_ms": int((time.time() - t0) * 1000)})
                 return result
 
-            return {
-                "ok": False,
-                "mode": "no_state_no_creds",
-                "error": "no_valid_state_and_no_creds",
-                "elapsed_ms": int((time.time() - t0) * 1000),
-            }
+            return {"ok": False, "mode": "no_state_no_creds", "error": "no_valid_state_and_no_creds",
+                    "elapsed_ms": int((time.time() - t0) * 1000)}
         finally:
             context.close(); browser.close()
 
-# ---------- public: last sold ----------
+# ---------- scrapers ----------
 def fetch_last_sold_once(url: str) -> dict:
     t0 = time.time()
     with sync_playwright() as p:
@@ -388,46 +338,28 @@ def fetch_last_sold_once(url: str) -> dict:
         page = context.new_page()
         try:
             try:
-                _goto_with_retries(page, url)
-                _click_consent_if_present(page)
+                _goto_with_retries(page, url); _click_consent_if_present(page)
             except Exception as e:
                 art = _save_debug(page, "nav-failed")
-                return {
-                    "url": url, "most_recent_sale": None, "error": "timeout_nav", "reason": str(e),
-                    "login": login_info, "artifacts": art,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "elapsed_ms": int((time.time() - t0) * 1000),
-                }
-
+                return {"url": url, "most_recent_sale": None, "error": "timeout_nav", "reason": str(e),
+                        "login": login_info, "artifacts": art, "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
             if not _is_logged_in(page) and not FORCE_STATE_ONLY and os.getenv("TCG_EMAIL") and os.getenv("TCG_PASSWORD"):
                 li2 = _do_login_flow(context, capture=True)
                 login_info = {"first": login_info, "retry": li2}
                 page = context.new_page(); _goto_with_retries(page, url); _click_consent_if_present(page)
-
             err = _anti_bot_check(page)
             if err:
                 art = _save_debug(page, "challenge")
-                return {
-                    "url": url, "most_recent_sale": None, "error": err,
-                    "login": login_info, "artifacts": art,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "elapsed_ms": int((time.time() - t0) * 1000),
-                }
-
+                return {"url": url, "most_recent_sale": None, "error": err, "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(), "elapsed_ms": int((time.time() - t0) * 1000)}
             html = page.content()
             price = _extract_recent_sale_from_html(html)
-
-            return {
-                "url": url,
-                "most_recent_sale": price,
-                "login": login_info,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "elapsed_ms": int((time.time() - t0) * 1000),
-            }
+            return {"url": url, "most_recent_sale": price, "login": login_info,
+                    "timestamp": datetime.now(timezone.utc).isoformat(), "elapsed_ms": int((time.time() - t0) * 1000)}
         finally:
             context.close(); browser.close()
 
-# ---------- dialog helpers & snapshot ----------
 def _extract_tables_from_dialog_html(html: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "lxml")
     out: List[Dict[str, Any]] = []
@@ -440,7 +372,6 @@ def _extract_tables_from_dialog_html(html: str) -> List[Dict[str, Any]]:
             first = t.find("tr")
             if first:
                 headers = [c.get_text(" ", strip=True) for c in first.find_all(["th", "td"])]
-
         rows: List[Dict[str, Any]] = []
         bodies = t.find_all("tbody") or [t]
         for body in bodies:
@@ -452,7 +383,6 @@ def _extract_tables_from_dialog_html(html: str) -> List[Dict[str, Any]]:
                     rows.append({headers[i] or f"col_{i}": cells[i] for i in range(len(cells))})
                 else:
                     rows.append({"cols": cells})
-
         out.append({"headers": headers, "rows": rows})
     return out
 
@@ -560,16 +490,13 @@ def fetch_sales_snapshot(url: str) -> dict:
         page = context.new_page()
         try:
             try:
-                _goto_with_retries(page, url)
-                _click_consent_if_present(page)
+                _goto_with_retries(page, url); _click_consent_if_present(page)
             except Exception as e:
                 art = _save_debug(page, "nav-failed")
-                return {
-                    "url": url, "title": None, "tables": [], "stats": [], "text": None,
-                    "error": "timeout_nav", "reason": str(e), "login": login_info, "artifacts": art,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "elapsed_ms": int((time.time() - t0) * 1000),
-                }
+                return {"url": url, "title": None, "tables": [], "stats": [], "text": None,
+                        "error": "timeout_nav", "reason": str(e), "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
 
             if not _is_logged_in(page) and not FORCE_STATE_ONLY and os.getenv("TCG_EMAIL") and os.getenv("TCG_PASSWORD"):
                 li2 = _do_login_flow(context, capture=True)
@@ -579,23 +506,19 @@ def fetch_sales_snapshot(url: str) -> dict:
             err = _anti_bot_check(page)
             if err:
                 art = _save_debug(page, "challenge")
-                return {
-                    "url": url, "title": None, "tables": [], "stats": [], "text": None,
-                    "error": err, "login": login_info, "artifacts": art,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "elapsed_ms": int((time.time() - t0) * 1000),
-                }
+                return {"url": url, "title": None, "tables": [], "stats": [], "text": None,
+                        "error": err, "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
 
             try:
                 _open_snapshot_dialog(page, wait_ms=SNAPSHOT_WAIT_MS)
             except Exception as e:
                 art = _save_debug(page, "dialog-failed")
-                return {
-                    "url": url, "title": None, "tables": [], "stats": [], "text": None,
-                    "error": "timeout_dialog", "reason": str(e), "login": login_info, "artifacts": art,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "elapsed_ms": int((time.time() - t0) * 1000),
-                }
+                return {"url": url, "title": None, "tables": [], "stats": [], "text": None,
+                        "error": "timeout_dialog", "reason": str(e), "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
 
             dialog = None
             for sel in [
@@ -613,12 +536,10 @@ def fetch_sales_snapshot(url: str) -> dict:
 
             if not dialog:
                 art = _save_debug(page, "dialog-missing-after-open")
-                return {
-                    "url": url, "title": None, "tables": [], "stats": [], "text": None,
-                    "error": "dialog_not_found_after_open", "login": login_info, "artifacts": art,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "elapsed_ms": int((time.time() - t0) * 1000),
-                }
+                return {"url": url, "title": None, "tables": [], "stats": [], "text": None,
+                        "error": "dialog_not_found_after_open", "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
 
             dialog_html = dialog.inner_html()
             dialog_text = dialog.inner_text()
@@ -629,27 +550,19 @@ def fetch_sales_snapshot(url: str) -> dict:
 
             if not tables and not stats and (not dialog_text or not dialog_text.strip()):
                 art = _save_debug(page, "dialog-empty")
-                return {
-                    "url": url, "title": title, "tables": [], "stats": [], "text": None,
-                    "error": "dialog_empty", "login": login_info, "artifacts": art,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "elapsed_ms": int((time.time() - t0) * 1000),
-                }
+                return {"url": url, "title": title, "tables": [], "stats": [], "text": None,
+                        "error": "dialog_empty", "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
 
-            return {
-                "url": url,
-                "title": title,
-                "tables": tables,
-                "stats": stats,
-                "text": dialog_text.strip() if dialog_text else None,
-                "login": login_info,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "elapsed_ms": int((time.time() - t0) * 1000),
-            }
+            return {"url": url, "title": title, "tables": tables, "stats": stats,
+                    "text": dialog_text.strip() if dialog_text else None,
+                    "login": login_info, "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "elapsed_ms": int((time.time() - t0) * 1000)}
         finally:
             context.close(); browser.close()
 
-# ---------- DEBUG HELPERS ----------
+# ---------- debug helpers ----------
 def debug_proxy_ip() -> dict:
     t0 = time.time()
     with sync_playwright() as p:
@@ -657,13 +570,9 @@ def debug_proxy_ip() -> dict:
         page = context.new_page()
         try:
             page.goto("https://api.ipify.org?format=json", timeout=30000, wait_until="load")
-            return {
-                "ok": True,
-                "ipify": (page.text_content("body") or "").strip(),
-                "proxy_in_use": bool(_parse_proxy_env()),
-                "user_agent": USER_AGENT,
-                "elapsed_ms": int((time.time() - t0) * 1000),
-            }
+            return {"ok": True, "ipify": (page.text_content("body") or "").strip(),
+                    "proxy_in_use": bool(_parse_proxy_env()), "user_agent": USER_AGENT,
+                    "elapsed_ms": int((time.time() - t0) * 1000)}
         finally:
             context.close(); browser.close()
 
@@ -673,10 +582,15 @@ def debug_cookies() -> dict:
     state_cookies = []
     try:
         if pathlib.Path(STATE_PATH).exists():
-            state = _json.loads(open(STATE_PATH, "r", encoding="utf-8").read())
+            state = _json.loads(open(STATE_PATH, "r", encoding="utf-8")).read()  # type: ignore
+    except Exception:
+        state = None
+    if state:
+        try:
+            state = json.loads(open(STATE_PATH, "r", encoding="utf-8").read())
             state_cookies = [{"name": c.get("name"), "domain": c.get("domain")} for c in state.get("cookies", [])]
-    except Exception as e:
-        state_cookies = [{"error_reading_state": str(e)}]
+        except Exception:
+            state_cookies = []
 
     with sync_playwright() as p:
         browser, context = _new_context(p, use_saved_state=True)
@@ -686,15 +600,10 @@ def debug_cookies() -> dict:
             _click_consent_if_present(page)
             ctx_cookies = context.cookies()
             tcg_ctx = [{"name": c.get("name"), "domain": c.get("domain")} for c in ctx_cookies if "tcgplayer" in (c.get("domain") or "")]
-            return {
-                "ok": True,
-                "state_cookie_count": len(state_cookies),
-                "state_cookie_domains": sorted({c.get("domain") for c in state_cookies if isinstance(c, dict) and c.get("domain")}),
-                "ctx_cookie_count": len(ctx_cookies),
-                "ctx_tcg_cookies": tcg_ctx,
-                "logged_in_flag": _is_logged_in(page),
-                "elapsed_ms": int((time.time() - t0) * 1000),
-            }
+            return {"ok": True, "state_cookie_count": len(state_cookies),
+                    "state_cookie_domains": sorted({c.get("domain") for c in state_cookies if isinstance(c, dict) and c.get("domain")}),
+                    "ctx_cookie_count": len(ctx_cookies), "ctx_tcg_cookies": tcg_ctx,
+                    "logged_in_flag": _is_logged_in(page), "elapsed_ms": int((time.time() - t0) * 1000)}
         finally:
             context.close(); browser.close()
 
@@ -706,12 +615,8 @@ def debug_localstorage() -> dict:
         try:
             page.goto("https://www.tcgplayer.com/", wait_until="domcontentloaded", timeout=30000)
             keys = page.evaluate("""() => Object.keys(window.localStorage || {}).slice(0, 50)""")
-            return {
-                "ok": True,
-                "keys_sample": keys,
-                "logged_in_flag": _is_logged_in(page),
-                "elapsed_ms": int((time.time() - t0) * 1000),
-            }
+            return {"ok": True, "keys_sample": keys, "logged_in_flag": _is_logged_in(page),
+                    "elapsed_ms": int((time.time() - t0) * 1000)}
         finally:
             context.close(); browser.close()
 
@@ -725,15 +630,8 @@ def debug_visit(url: str) -> dict:
             _click_consent_if_present(page)
             anti = _anti_bot_check(page)
             arts = _save_debug(page, "debug-visit")
-            return {
-                "ok": True,
-                "url": page.url,
-                "title": page.title(),
-                "logged_in_flag": _is_logged_in(page),
-                "anti_bot": anti,
-                "artifacts": arts,
-                "elapsed_ms": int((time.time() - t0) * 1000),
-            }
+            return {"ok": True, "url": page.url, "title": page.title(), "logged_in_flag": _is_logged_in(page),
+                    "anti_bot": anti, "artifacts": arts, "elapsed_ms": int((time.time() - t0) * 1000)}
         finally:
             context.close(); browser.close()
 
@@ -748,19 +646,12 @@ def debug_trace(url: str) -> dict:
             _goto_with_retries(page, url)
             _click_consent_if_present(page)
             context.tracing.stop(path=trace_path)
-            return {
-                "ok": True,
-                "trace": trace_path,
-                "final_url": page.url,
-                "title": page.title(),
-                "logged_in_flag": _is_logged_in(page),
-                "elapsed_ms": int((time.time() - t0) * 1000),
-            }
+            return {"ok": True, "trace": trace_path, "final_url": page.url, "title": page.title(),
+                    "logged_in_flag": _is_logged_in(page), "elapsed_ms": int((time.time() - t0) * 1000)}
         finally:
             context.close(); browser.close()
 
 def debug_myaccount() -> dict:
-    """Navigate to /myaccount and report if we get redirected to /login (definitive auth check)."""
     t0 = time.time()
     with sync_playwright() as p:
         browser, context = _new_context(p, use_saved_state=True)
@@ -772,15 +663,34 @@ def debug_myaccount() -> dict:
             final = page.url
             anti = _anti_bot_check(page)
             arts = _save_debug(page, "debug-myaccount")
-            return {
-                "ok": True,
-                "start_url": start,
-                "final_url": final,
-                "redirected_to_login": ("login" in final.lower()),
-                "logged_in_flag": _is_logged_in(page),
-                "anti_bot": anti,
-                "artifacts": arts,
-                "elapsed_ms": int((time.time() - t0) * 1000),
-            }
+            return {"ok": True, "start_url": start, "final_url": final,
+                    "redirected_to_login": ("login" in final.lower()),
+                    "logged_in_flag": _is_logged_in(page), "anti_bot": anti,
+                    "artifacts": arts, "elapsed_ms": int((time.time() - t0) * 1000)}
+        finally:
+            context.close(); browser.close()
+
+def debug_js() -> dict:
+    """Confirm JS/runtime signals and whether <noscript> is present on homepage."""
+    t0 = time.time()
+    with sync_playwright() as p:
+        browser, context = _new_context(p, use_saved_state=True)
+        page = context.new_page()
+        try:
+            page.goto("https://www.tcgplayer.com/", wait_until="domcontentloaded", timeout=30000)
+            _click_consent_if_present(page)
+            info = page.evaluate("""
+                () => ({
+                  ua: navigator.userAgent,
+                  platform: navigator.platform,
+                  languages: navigator.languages,
+                  webdriver: navigator.webdriver,
+                  hasWindowChrome: !!window.chrome,
+                  jsTypeofWindow: typeof window,
+                })
+            """)
+            noscript_present = page.locator("noscript").count() > 0
+            return {"ok": True, "info": info, "noscript_present_in_dom": bool(noscript_present),
+                    "elapsed_ms": int((time.time() - t0) * 1000)}
         finally:
             context.close(); browser.close()
