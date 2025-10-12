@@ -310,6 +310,63 @@ def _ensure_logged_in(context) -> Dict[str, Any]:
 
     return {"ok": False, "error": "no_valid_state_and_no_creds"}
 
+# ---------- DEBUG: login-only state verification ----------
+def debug_login_only() -> Dict[str, Any]:
+    """
+    Verify if current storage state (and proxy/UA) produce a logged-in homepage.
+    If FORCE_STATE_ONLY=1 and not logged in, we don't attempt password login.
+    """
+    t0 = time.time()
+    with sync_playwright() as p:
+        browser, context = _new_context(p, use_saved_state=True)
+        try:
+            page = context.new_page()
+            try:
+                page.goto("https://www.tcgplayer.com/", wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+                _click_consent_if_present(page)
+                before = _save_debug(page, "login-state-check-before")
+
+                if _is_logged_in(page):
+                    after = _save_debug(page, "login-state-check-after")
+                    return {
+                        "ok": True,
+                        "mode": "state_only_check",
+                        "before": before,
+                        "after": after,
+                        "elapsed_ms": int((time.time() - t0) * 1000),
+                        "state_path": STATE_PATH,
+                    }
+
+                # Not logged in using state
+                if FORCE_STATE_ONLY:
+                    after = _save_debug(page, "login-state-check-after")
+                    return {
+                        "ok": False,
+                        "mode": "state_only_check",
+                        "error": "not_logged_in_with_state",
+                        "before": before,
+                        "after": after,
+                        "elapsed_ms": int((time.time() - t0) * 1000),
+                    }
+
+            finally:
+                page.close()
+
+            # Try password login only if allowed and creds exist
+            if not FORCE_STATE_ONLY and os.getenv("TCG_EMAIL") and os.getenv("TCG_PASSWORD"):
+                result = _do_login_flow(context, capture=True)
+                result.update({"elapsed_ms": int((time.time() - t0) * 1000)})
+                return result
+
+            return {
+                "ok": False,
+                "mode": "no_state_no_creds",
+                "error": "no_valid_state_and_no_creds",
+                "elapsed_ms": int((time.time() - t0) * 1000),
+            }
+        finally:
+            context.close(); browser.close()
+
 # ---------- public: last sold ----------
 def fetch_last_sold_once(url: str) -> dict:
     t0 = time.time()
@@ -392,10 +449,12 @@ def _extract_key_values_from_dialog_html(html: str) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     for dl in soup.find_all("dl"):
         dts = [dt.get_text(" ", strip=True) for dt in dl.find_all("dt")]
-        dds = [dd.get_text(" ", strip=True) for dd in dl.find_all("dd")]
+        dds = [dd.get_text(" ", "strip") for dd in dl.find_all("dd")]  # tolerate odd whitespace
         for i in range(min(len(dts), len(dds))):
-            if dts[i] or dds[i]:
-                out.append({"label": dts[i], "value": dds[i]})
+            label = (dts[i] or "").strip()
+            value = (dds[i] or "").strip()
+            if label or value:
+                out.append({"label": label, "value": value})
     text = soup.get_text("\n", strip=True)
     for line in text.splitlines():
         if ":" in line:
