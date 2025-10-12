@@ -1,7 +1,13 @@
 # scripts/one_shot.py
-# - Logs in if env creds provided (TCG_EMAIL / TCG_PASSWORD), saves session to /app/state.json
-# - fetch_last_sold_once(url): prior behavior
-# - fetch_sales_snapshot(url): NEW — opens "Sales History Snapshot" dialog and extracts tables/text as JSON
+# Robust one-shot scrapers:
+#  - fetch_last_sold_once(url)
+#  - fetch_sales_snapshot(url)
+#
+# Improvements:
+#  * Configurable timeouts via env: TIMEOUT_MS (default 45000), SNAPSHOT_WAIT_MS (default 12000)
+#  * Resilient navigation with retries/backoff
+#  * Smarter consent handling, scrolling, and multiple selector strategies
+#  * Clear error payloads instead of generic timeouts
 
 import os
 import re
@@ -9,7 +15,7 @@ import time
 import base64
 import pathlib
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page
@@ -17,11 +23,24 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page
 
 STATE_PATH = "/app/state.json"  # persisted session cookies (inside container FS)
 
+# ---- Configurable timeouts (ms) via env ----
+def _env_int(name: str, default: int) -> int:
+    try:
+        v = int(os.getenv(name, "").strip())
+        return v if v > 0 else default
+    except Exception:
+        return default
+
+NAV_TIMEOUT_MS      = _env_int("TIMEOUT_MS", 45000)        # for page.goto / network settles
+SNAPSHOT_WAIT_MS    = _env_int("SNAPSHOT_WAIT_MS", 12000)  # for dialog to appear
+RETRY_TIMES         = _env_int("RETRY_TIMES", 2)           # navigation/dialog retries
+DEBUG               = os.getenv("DEBUG") == "1"
+
 # -----------------------------
 # Utilities
 # -----------------------------
 
-def _to_money_float(text: str) -> float | None:
+def _to_money_float(text: str) -> Optional[float]:
     if not text:
         return None
     m = re.search(r"\$[0-9][0-9,]*\.?[0-9]{0,2}", text)
@@ -32,7 +51,7 @@ def _to_money_float(text: str) -> float | None:
     except:
         return None
 
-def _extract_recent_sale_from_html(html: str) -> float | None:
+def _extract_recent_sale_from_html(html: str) -> Optional[float]:
     """Find price near 'Most Recent Sale' or 'Last Sold'; fallback to first money token."""
     soup = BeautifulSoup(html, "lxml")
 
@@ -56,10 +75,12 @@ def _click_consent_if_present(page: Page):
         'button:has-text("I Accept")',
         '[data-testid="accept-all"]',
         'button[aria-label*="Accept"]',
+        '[aria-label*="Accept all"]',
     ]:
         try:
-            page.locator(sel).click(timeout=1500)
-            break
+            if page.locator(sel).first.is_visible():
+                page.locator(sel).first.click(timeout=1500)
+                break
         except Exception:
             pass
 
@@ -75,7 +96,7 @@ def _ensure_login(context) -> None:
 
     page = context.new_page()
     try:
-        page.goto("https://www.tcgplayer.com/login", wait_until="domcontentloaded", timeout=30000)
+        page.goto("https://www.tcgplayer.com/login", wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
 
         # If redirected away from login page, assume already logged in
         if "login" not in page.url.lower():
@@ -85,24 +106,21 @@ def _ensure_login(context) -> None:
         # Fill email
         for sel in ['input[name="email"]', 'input[type="email"]', '#email']:
             try:
-                page.fill(sel, email, timeout=4000)
-                break
+                page.fill(sel, email, timeout=4000); break
             except PWTimeout:
                 pass
 
         # Fill password
         for sel in ['input[name="password"]', 'input[type="password"]', '#password']:
             try:
-                page.fill(sel, password, timeout=4000)
-                break
+                page.fill(sel, password, timeout=4000); break
             except PWTimeout:
                 pass
 
         # Submit
         for sel in ['button[type="submit"]', 'button:has-text("Sign In")', 'button:has-text("Log In")']:
             try:
-                page.click(sel, timeout=4000)
-                break
+                page.click(sel, timeout=4000); break
             except PWTimeout:
                 pass
 
@@ -130,12 +148,30 @@ def _new_context(p, use_saved_state: bool):
     )
     return browser, context
 
-def _anti_bot_check(page: Page) -> str | None:
+def _anti_bot_check(page: Page) -> Optional[str]:
     title = (page.title() or "")
     body = (page.text_content("body") or "").lower()
     if "access denied" in title.lower() or "verify you are a human" in body or "are you human" in body:
         return "blocked_or_challenge"
     return None
+
+def _goto_with_retries(page: Page, url: str) -> None:
+    """Navigate with retries & exponential backoff; favor 'load' then settle to 'networkidle'."""
+    last_err = None
+    for attempt in range(RETRY_TIMES + 1):
+        try:
+            page.goto(url, wait_until="load", timeout=NAV_TIMEOUT_MS)
+            # give client-side scripts time to attach
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(15000, NAV_TIMEOUT_MS // 2))
+            except Exception:
+                # not fatal; proceed
+                pass
+            return
+        except Exception as e:
+            last_err = e
+            page.wait_for_timeout(500 * (attempt + 1))  # backoff
+    raise last_err if last_err else RuntimeError("navigation failed")
 
 # -----------------------------
 # Public: previous function
@@ -143,7 +179,6 @@ def _anti_bot_check(page: Page) -> str | None:
 
 def fetch_last_sold_once(url: str) -> dict:
     t0 = time.time()
-    debug = os.getenv("DEBUG") == "1"
 
     with sync_playwright() as p:
         browser, context = _new_context(p, use_saved_state=True)
@@ -154,8 +189,7 @@ def fetch_last_sold_once(url: str) -> dict:
 
         page = context.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=35000)
-            page.wait_for_load_state("networkidle", timeout=15000)
+            _goto_with_retries(page, url)
             _click_consent_if_present(page)
 
             err = _anti_bot_check(page)
@@ -172,13 +206,12 @@ def fetch_last_sold_once(url: str) -> dict:
             if not pathlib.Path(STATE_PATH).exists():
                 context.storage_state(path=STATE_PATH)
 
-            # Light debug (optional)
-            if debug and price is None:
+            if DEBUG and price is None:
                 img_b64 = base64.b64encode(page.screenshot(full_page=True)).decode("ascii")
-                print("[DEBUG] title:", page.title())
-                print("[DEBUG] url:", page.url)
-                print("[DEBUG] html_head:", html[:1500].replace("\n", " "))
-                print("[DEBUG] screenshot_b64_prefix:", img_b64[:120])
+                print("[DEBUG] last_sold title:", page.title())
+                print("[DEBUG] last_sold url:", page.url)
+                print("[DEBUG] last_sold html_head:", html[:1500].replace("\n", " "))
+                print("[DEBUG] last_sold screenshot_prefix:", img_b64[:120])
 
             return {
                 "url": url,
@@ -194,15 +227,10 @@ def fetch_last_sold_once(url: str) -> dict:
 # -----------------------------
 
 def _extract_tables_from_dialog_html(html: str) -> List[Dict[str, Any]]:
-    """
-    Parse any <table> elements inside the dialog.
-    Returns a list of tables with headers + rows.
-    """
+    """Parse any <table> elements inside the dialog."""
     soup = BeautifulSoup(html, "lxml")
     tables_out: List[Dict[str, Any]] = []
 
-    # optional: capture any heading near the top
-    # (we'll also return top-level text separately)
     for t in soup.find_all("table"):
         # headers
         headers = []
@@ -211,7 +239,6 @@ def _extract_tables_from_dialog_html(html: str) -> List[Dict[str, Any]]:
             ths = thead.find_all(["th", "td"])
             headers = [th.get_text(" ", strip=True) for th in ths if th.get_text(strip=True)]
         else:
-            # sometimes header row is first tr of tbody
             first_tr = t.find("tr")
             if first_tr:
                 headers = [cell.get_text(" ", strip=True) for cell in first_tr.find_all(["th", "td"])]
@@ -222,7 +249,6 @@ def _extract_tables_from_dialog_html(html: str) -> List[Dict[str, Any]]:
         for body in tbodies:
             for tr in body.find_all("tr"):
                 cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-                # skip header-like row duplicated
                 if headers and cells == headers:
                     continue
                 if headers and len(headers) == len(cells):
@@ -230,17 +256,12 @@ def _extract_tables_from_dialog_html(html: str) -> List[Dict[str, Any]]:
                 else:
                     rows.append({"cols": cells})
 
-        tables_out.append({
-            "headers": headers,
-            "rows": rows,
-        })
+        tables_out.append({"headers": headers, "rows": rows})
 
     return tables_out
 
 def _extract_key_values_from_dialog_html(html: str) -> List[Dict[str, str]]:
-    """
-    Extract simple key-value stats if the dialog uses <dl>, or scattered 'Label: Value' text.
-    """
+    """Extract simple key-value stats if the dialog uses <dl>, or scattered 'Label: Value' text."""
     soup = BeautifulSoup(html, "lxml")
     out: List[Dict[str, str]] = []
 
@@ -261,12 +282,24 @@ def _extract_key_values_from_dialog_html(html: str) -> List[Dict[str, str]]:
                 out.append({"label": label.strip(), "value": value.strip()})
     return out
 
+def _scroll_into_view(page: Page, selector: str) -> None:
+    try:
+        loc = page.locator(selector).first
+        if loc.count() > 0:
+            loc.scroll_into_view_if_needed(timeout=1500)
+    except Exception:
+        pass
+
 def _open_snapshot_dialog(page: Page) -> None:
     """
     Click the 'history' button to open 'Sales History Snapshot' dialog.
-    Tries a few robust selectors and waits for the dialog to appear.
+    Tries multiple strategies and waits for the dialog to appear.
     """
-    # Try clicking the known container or an internal button
+    # ensure the header block is in view
+    _scroll_into_view(page, ".latest-sales__header__history")
+
+    # Try clicking known button first
+    clicked = False
     for sel in [
         ".latest-sales__header__history button",
         ".latest-sales__header__history",
@@ -277,22 +310,38 @@ def _open_snapshot_dialog(page: Page) -> None:
         try:
             loc = page.locator(sel).first
             if loc and loc.is_visible():
-                loc.click(timeout=3000)
+                loc.click(timeout=2500)
+                clicked = True
                 break
         except Exception:
             pass
 
-    # Wait for a dialog with proper title, or any dialog with the title inside
-    try:
-        # Preferred: ARIA dialog by name
-        dialog = page.get_by_role("dialog", name=re.compile(r"Sales\s+History\s+Snapshot", re.I)).first
-        dialog.wait_for(timeout=6000)
-        return
-    except Exception:
-        pass
+    if not clicked:
+        # Try JS click on the container (sometimes overlays intercept normal clicks)
+        try:
+            page.evaluate("""
+              (sel)=>{ const el=document.querySelector(sel); if(el){ el.click(); return true;} return false; }
+            """, ".latest-sales__header__history")
+            clicked = True
+        except Exception:
+            pass
 
-    # Fallback: wait for text then consider the closest dialog/container
-    page.locator('text=/Sales\\s+History\\s+Snapshot/i').first.wait_for(timeout=6000)
+    # Wait for dialog: role-based first, then text-based
+    last_err = None
+    for attempt in range(RETRY_TIMES + 1):
+        try:
+            dlg = page.get_by_role("dialog", name=re.compile(r"Sales\\s+History\\s+Snapshot", re.I)).first
+            dlg.wait_for(timeout=SNAPSHOT_WAIT_MS)
+            return
+        except Exception as e:
+            last_err = e
+            try:
+                page.locator('text=/Sales\\s+History\\s+Snapshot/i').first.wait_for(timeout=SNAPSHOT_WAIT_MS)
+                return
+            except Exception as e2:
+                last_err = e2
+                page.wait_for_timeout(500 * (attempt + 1))  # small backoff
+    raise last_err if last_err else RuntimeError("snapshot dialog not found")
 
 def fetch_sales_snapshot(url: str) -> dict:
     """
@@ -300,7 +349,6 @@ def fetch_sales_snapshot(url: str) -> dict:
     parse all tables + key-values + top-level text into JSON.
     """
     t0 = time.time()
-    debug = os.getenv("DEBUG") == "1"
 
     with sync_playwright() as p:
         browser, context = _new_context(p, use_saved_state=True)
@@ -311,8 +359,7 @@ def fetch_sales_snapshot(url: str) -> dict:
 
         page = context.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=35000)
-            page.wait_for_load_state("networkidle", timeout=15000)
+            _goto_with_retries(page, url)
             _click_consent_if_present(page)
 
             err = _anti_bot_check(page)
@@ -324,47 +371,43 @@ def fetch_sales_snapshot(url: str) -> dict:
                     "elapsed_ms": int((time.time() - t0) * 1000),
                 }
 
-            # Open the dialog
+            # Open the dialog (with retries)
             _open_snapshot_dialog(page)
 
-            # Try to grab the dialog node (role-based)
+            # Prefer role-based dialog; else fallback to typical modal containers
             dialog = None
             try:
-                dialog = page.get_by_role("dialog", name=re.compile(r"Sales\s+History\s+Snapshot", re.I)).first
-                dialog.wait_for(timeout=4000)
+                dialog = page.get_by_role("dialog", name=re.compile(r"Sales\\s+History\\s+Snapshot", re.I)).first
+                dialog.wait_for(timeout=3000)
             except Exception:
-                # Fallback: find the title text and take a nearby container
                 pass
 
-            # Get dialog HTML/text (role or fallback)
             if dialog:
                 dialog_html = dialog.inner_html()
                 dialog_text = dialog.inner_text()
                 title = "Sales History Snapshot"
             else:
-                # fallback: scope the whole body but still extract around the title text
-                title = "Sales History Snapshot"
-                # Narrow to a likely modal container (common modal classes)
+                # fallback: most visible modal-ish container
                 possible = page.locator(
                     'css=[role="dialog"], .modal, .MuiDialog-paper, .chakra-modal__content, [class*="dialog"], [class*="modal"]'
                 ).first
                 if possible and possible.is_visible():
                     dialog_html = possible.inner_html()
                     dialog_text = possible.inner_text()
+                    title = "Sales History Snapshot"
                 else:
                     # last resort: entire page
                     dialog_html = page.content()
                     dialog_text = page.inner_text("body")
+                    title = "Sales History Snapshot (fallback)"
 
-            # Parse tables & key-values
             tables = _extract_tables_from_dialog_html(dialog_html)
-            stats = _extract_key_values_from_dialog_html(dialog_html)
+            stats  = _extract_key_values_from_dialog_html(dialog_html)
 
             if not pathlib.Path(STATE_PATH).exists():
                 context.storage_state(path=STATE_PATH)
 
-            # Optional debug
-            if debug:
+            if DEBUG:
                 try:
                     img_b64 = base64.b64encode(page.screenshot(full_page=True)).decode("ascii")
                     print("[DEBUG][snapshot] url:", page.url)
@@ -376,9 +419,9 @@ def fetch_sales_snapshot(url: str) -> dict:
             return {
                 "url": url,
                 "title": title,
-                "tables": tables,           # list of { headers: [...], rows: [ {col:value} | {cols:[...]} ] }
-                "stats": stats,             # list of {label, value} extracted from dl or "Label: Value" lines
-                "text": dialog_text.strip() if dialog_text else None,  # full dialog text (for backup)
+                "tables": tables,
+                "stats": stats,
+                "text": dialog_text.strip() if dialog_text else None,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "elapsed_ms": int((time.time() - t0) * 1000),
             }
