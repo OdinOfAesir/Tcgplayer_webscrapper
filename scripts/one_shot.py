@@ -1,11 +1,11 @@
 # scripts/one_shot.py
 # Proxy-ready Playwright helpers for FastAPI.
-# - Parses HTTP_PROXY/HTTPS_PROXY (with username/password) and applies to Playwright context
+# - Parses HTTP(S)/SOCKS proxy env (with username/password) and applies to Playwright context
 # - Loads logged-in storage state from STATE_B64 -> /app/state.json
 # - FORCE_STATE_ONLY=1 prevents password login (avoids CAPTCHA)
-# - USER_AGENT override to match when you captured state.json
+# - USER_AGENT + fingerprint spoof (platform, languages, no webdriver)
 # - Scrapers: fetch_last_sold_once, fetch_sales_snapshot
-# - Debug helpers: login check, proxy IP, cookies, localStorage, visit (artifacts), trace
+# - Debug helpers: login check, proxy IP, cookies, localStorage, visit (artifacts), trace, myaccount probe
 
 import os
 import re
@@ -55,6 +55,9 @@ USER_AGENT       = os.getenv("USER_AGENT") or (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+# New: fingerprint knobs (match your real desktop used to capture state)
+NAV_PLATFORM = os.getenv("NAV_PLATFORM", "MacIntel")
+NAV_LANGS    = os.getenv("NAV_LANGS", "en-US,en")
 
 # ---------- proxy parsing ----------
 def _parse_proxy_env():
@@ -155,7 +158,16 @@ def _new_context(p, use_saved_state: bool):
         has_touch=False,
         proxy=proxy_cfg,
     )
+    # Headers
     context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
+    # Fingerprint: navigator.* + remove webdriver + add window.chrome
+    langs_js = "[" + ",".join([f"'{x.strip()}'" for x in NAV_LANGS.split(",") if x.strip()]) + "]"
+    context.add_init_script(f"""
+        Object.defineProperty(navigator, 'platform', {{ get: () => '{NAV_PLATFORM}' }});
+        Object.defineProperty(navigator, 'languages', {{ get: () => {langs_js} }});
+        Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
+        window.chrome = window.chrome || {{ runtime: {{}} }};
+    """)
     return browser, context
 
 def _anti_bot_check(page: Page) -> Optional[str]:
@@ -449,7 +461,7 @@ def _extract_key_values_from_dialog_html(html: str) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     for dl in soup.find_all("dl"):
         dts = [dt.get_text(" ", strip=True) for dt in dl.find_all("dt")]
-        dds = [dd.get_text(" ", "strip") for dd in dl.find_all("dd")]  # tolerate odd whitespace
+        dds = [dd.get_text(" ", strip=True) for dd in dl.find_all("dd")]
         for i in range(min(len(dts), len(dds))):
             label = (dts[i] or "").strip()
             value = (dds[i] or "").strip()
@@ -742,6 +754,32 @@ def debug_trace(url: str) -> dict:
                 "final_url": page.url,
                 "title": page.title(),
                 "logged_in_flag": _is_logged_in(page),
+                "elapsed_ms": int((time.time() - t0) * 1000),
+            }
+        finally:
+            context.close(); browser.close()
+
+def debug_myaccount() -> dict:
+    """Navigate to /myaccount and report if we get redirected to /login (definitive auth check)."""
+    t0 = time.time()
+    with sync_playwright() as p:
+        browser, context = _new_context(p, use_saved_state=True)
+        page = context.new_page()
+        try:
+            start = "https://www.tcgplayer.com/myaccount/"
+            _goto_with_retries(page, start)
+            _click_consent_if_present(page)
+            final = page.url
+            anti = _anti_bot_check(page)
+            arts = _save_debug(page, "debug-myaccount")
+            return {
+                "ok": True,
+                "start_url": start,
+                "final_url": final,
+                "redirected_to_login": ("login" in final.lower()),
+                "logged_in_flag": _is_logged_in(page),
+                "anti_bot": anti,
+                "artifacts": arts,
                 "elapsed_ms": int((time.time() - t0) * 1000),
             }
         finally:
