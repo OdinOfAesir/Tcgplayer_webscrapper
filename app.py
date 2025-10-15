@@ -8,6 +8,8 @@ from scripts.one_shot import (
     fetch_last_sold_once,
     fetch_sales_snapshot,
     fetch_active_listings,
+    fetch_pages_in_product,
+    fetch_active_listings_in_page,
     debug_login_only,
     debug_proxy_ip,
     debug_cookies,
@@ -55,6 +57,27 @@ def active_listings(payload: dict):
     if not product_id:
         raise HTTPException(status_code=400, detail="Missing productId")
     return JSONResponse(fetch_active_listings(str(product_id)))
+
+@app.post("/pages-in-product")
+def pages_in_product(payload: dict):
+    product_id = payload.get("productId") or payload.get("product_id")
+    if not product_id:
+        raise HTTPException(status_code=400, detail="Missing productId")
+    return JSONResponse(fetch_pages_in_product(str(product_id)))
+
+@app.post("/active-listings-in-page")
+def active_listings_in_page(payload: dict):
+    product_id = payload.get("productId") or payload.get("product_id")
+    page = payload.get("page") or payload.get("pageNumber")
+    if not product_id:
+        raise HTTPException(status_code=400, detail="Missing productId")
+    if page is None:
+        raise HTTPException(status_code=400, detail="Missing page number")
+    try:
+        page_num = int(page)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid page number")
+    return JSONResponse(fetch_active_listings_in_page(str(product_id), page_num))
 
 # ---- Debug / Diagnostics (PUBLIC in this build) ----
 

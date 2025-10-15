@@ -8,7 +8,8 @@ import uuid
 import json
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
+import hashlib
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page
@@ -611,6 +612,236 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
 
     return processed
 
+def _normalize_pagination_target(current_url: str, target: Optional[str]) -> Optional[str]:
+    if not target:
+        return None
+    target = target.strip()
+    if not target or target.lower().startswith("javascript"):
+        return None
+    try:
+        current_parts = urlparse(current_url)
+        joined = urljoin(current_url, target)
+        dest_parts = urlparse(joined)
+
+        if not dest_parts.netloc:
+            dest_parts = dest_parts._replace(netloc=current_parts.netloc, scheme=current_parts.scheme)
+        if not dest_parts.path:
+            dest_parts = dest_parts._replace(path=current_parts.path)
+
+        current_q = {k: v for k, v in parse_qsl(current_parts.query, keep_blank_values=True)}
+        dest_q = {k: v for k, v in parse_qsl(dest_parts.query, keep_blank_values=True)}
+        merged_q = current_q
+        merged_q.update(dest_q)
+
+        new_query = urlencode(merged_q, doseq=False)
+        dest_parts = dest_parts._replace(query=new_query)
+
+        return dest_parts.geturl()
+    except Exception:
+        return None
+
+def _wait_for_listings_refresh(page: Page,
+                               prev_html: Optional[str],
+                               prev_label: Optional[str],
+                               prev_url: str,
+                               timeout_ms: int) -> bool:
+    try:
+        page.wait_for_function(
+            """
+            (arg) => {
+                const listings = document.querySelector('.product-details__listings');
+                if (!listings) { return false; }
+                const html = listings.innerHTML || '';
+                const pager = document.querySelector('.tcg-pagination.search-pagination [aria-current="page"], .tcg-pagination.search-pagination [aria-current="true"], .tcg-pagination.search-pagination .is-current, .tcg-pagination.search-pagination .active');
+                const label = pager ? (pager.textContent || '').trim() : null;
+
+                if (!arg.prev_html) {
+                    return html.length > 0;
+                }
+                if (html && html !== arg.prev_html) {
+                    return true;
+                }
+                if (label && arg.prev_label && label !== arg.prev_label) {
+                    return true;
+                }
+                if (window.location.href !== arg.prev_url) {
+                    return true;
+                }
+                return false;
+            }
+            """,
+            {"prev_html": prev_html or "", "prev_label": prev_label or "", "prev_url": prev_url or ""},
+            timeout=timeout_ms
+        )
+        return True
+    except Exception:
+        return False
+
+def _detect_current_page(page: Page) -> Optional[int]:
+    try:
+        label = page.evaluate(
+            """
+            () => {
+                const root = document.querySelector('.tcg-pagination.search-pagination');
+                if (!root) { return null; }
+                const current = root.querySelector('[aria-current="page"], [aria-current="true"], .is-current, .active');
+                return current ? (current.textContent || '').trim() : null;
+            }
+            """
+        )
+        if label:
+            match = re.search(r"\d+", label)
+            if match:
+                return int(match.group(0))
+    except Exception:
+        pass
+    try:
+        parsed = urlparse(page.url)
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if "page" in params:
+            value = params.get("page")
+            if value is not None and value.strip():
+                return int(value)
+    except Exception:
+        pass
+    return None
+
+def _go_to_page_via_direct_url(page: Page, base_url: str, desired_page: int) -> bool:
+    desired_page = max(1, desired_page)
+    try:
+        prev_url = page.url
+    except Exception:
+        prev_url = base_url
+    try:
+        prev_label = page.evaluate(
+            """
+            () => {
+                const root = document.querySelector('.tcg-pagination.search-pagination');
+                if (!root) { return null; }
+                const current = root.querySelector('[aria-current="page"], [aria-current="true"], .is-current, .active');
+                return current ? (current.textContent || '').trim() : null;
+            }
+            """
+        )
+    except Exception:
+        prev_label = None
+    try:
+        prev_html = page.evaluate(
+            "() => { const el = document.querySelector('.product-details__listings'); return el ? el.innerHTML : null; }"
+        )
+    except Exception:
+        prev_html = None
+
+    normalized = _normalize_pagination_target(prev_url, f"?page={desired_page}")
+    if not normalized:
+        normalized = _normalize_pagination_target(base_url, f"?page={desired_page}")
+    if not normalized:
+        base_parts = urlparse(base_url)
+        rebuilt = base_parts._replace(query="")
+        fallback = rebuilt.geturl().rstrip("/")
+        normalized = f"{fallback}?page={desired_page}"
+    try:
+        page.goto(normalized, wait_until="load", timeout=max(NAV_TIMEOUT_MS, LISTING_PAGE_WAIT_MS))
+    except Exception:
+        return False
+
+    refreshed = _wait_for_listings_refresh(page, prev_html, prev_label, prev_url, LISTING_PAGE_WAIT_MS)
+    if not refreshed and page.url and page.url != prev_url:
+        refreshed = True
+    if not refreshed:
+        try:
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
+        refreshed = _wait_for_listings_refresh(page, prev_html, prev_label, prev_url, 2000)
+
+    try:
+        page.evaluate(
+            "() => { const root = document.querySelector('.tcg-pagination.search-pagination'); if (root) { root.querySelectorAll('[data-codex-next-marker]').forEach(el => el.removeAttribute('data-codex-next-marker')); } }"
+        )
+    except Exception:
+        pass
+
+    return refreshed
+
+def _navigate_to_page_number(page: Page, base_url: str, target_page: int, last_page: int) -> bool:
+    if last_page <= 0:
+        last_page = 1
+    target_page = max(1, min(last_page, target_page))
+    current = _detect_current_page(page) or 1
+    if current == target_page:
+        return True
+
+    if target_page <= 5 or last_page <= 5:
+        step = 1 if target_page > current else -1
+        guard = 0
+        while current != target_page and guard < 20:
+            guard += 1
+            next_page = current + step
+            next_page = max(1, min(last_page, next_page))
+            if next_page == current:
+                break
+            if not _go_to_page_via_direct_url(page, base_url, next_page):
+                return False
+            current = _detect_current_page(page) or next_page
+        return current == target_page
+
+    via_page = 5 if abs(target_page - 5) <= abs(last_page - target_page) else last_page
+
+    if current != via_page:
+        if via_page == 5 and current < 5:
+            guard_seq = 0
+            while current < 5 and guard_seq < 10:
+                guard_seq += 1
+                next_page = current + 1
+                if not _go_to_page_via_direct_url(page, base_url, next_page):
+                    return False
+                current = _detect_current_page(page) or next_page
+        if current != via_page:
+            if not _go_to_page_via_direct_url(page, base_url, via_page):
+                return False
+            current = _detect_current_page(page) or via_page
+
+    guard = 0
+    while current != target_page and guard < 20:
+        guard += 1
+        delta = target_page - current
+        if abs(delta) <= 5:
+            next_page = target_page
+        else:
+            next_page = current + (5 if delta > 0 else -5)
+        next_page = max(1, min(last_page, next_page))
+        if next_page == current:
+            break
+        if not _go_to_page_via_direct_url(page, base_url, next_page):
+            return False
+        current = _detect_current_page(page) or next_page
+
+    return current == target_page
+
+def _extract_last_page_number(page: Page) -> int:
+    try:
+        label = page.evaluate(
+            """
+            () => {
+                const root = document.querySelector('.tcg-pagination__pages');
+                if (!root) { return null; }
+                const anchors = Array.from(root.querySelectorAll('a')).filter(el => el.textContent && el.textContent.trim());
+                if (!anchors.length) { return null; }
+                const last = anchors[anchors.length - 1];
+                return last ? (last.textContent || '').trim() : null;
+            }
+            """
+        )
+        if label:
+            match = re.search(r"\d+", label)
+            if match:
+                value = int(match.group(0))
+                return value if value > 0 else 1
+    except Exception:
+        pass
+    return 1
+
 def _go_to_next_listings_page(page: Page) -> bool:
     selectors = [
         '.tcg-pagination.search-pagination a[aria-label*="Next"]:not([aria-disabled="true"])',
@@ -843,6 +1074,166 @@ def fetch_sales_snapshot(url: str) -> dict:
                     "text": dialog_text.strip() if dialog_text else None,
                     "login": login_info, "timestamp": datetime.now(timezone.utc).isoformat(),
                     "elapsed_ms": int((time.time() - t0) * 1000)}
+        finally:
+            context.close(); browser.close()
+
+def fetch_pages_in_product(product_id: str) -> dict:
+    """Fetch the total number of pages in a product's active listings."""
+    t0 = time.time()
+    url = f"https://www.tcgplayer.com/product/{product_id}"
+    with sync_playwright() as p:
+        browser, context = _new_context(p, use_saved_state=True)
+        login_info = _ensure_logged_in(context)
+        page = context.new_page()
+        try:
+            try:
+                _goto_with_retries(page, url); _click_consent_if_present(page)
+            except Exception as e:
+                art = _save_debug(page, "pages-nav-failed")
+                return {"product_id": str(product_id), "url": url, "total_pages": None,
+                        "error": "timeout_nav", "reason": str(e), "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            if not _is_logged_in(page) and not FORCE_STATE_ONLY and os.getenv("TCG_EMAIL") and os.getenv("TCG_PASSWORD"):
+                li2 = _do_login_flow(context, capture=True)
+                login_info = {"first": login_info, "retry": li2}
+                page = context.new_page(); _goto_with_retries(page, url); _click_consent_if_present(page)
+
+            err = _anti_bot_check(page)
+            if err:
+                art = _save_debug(page, "pages-challenge")
+                return {"product_id": str(product_id), "url": url, "total_pages": None,
+                        "error": err, "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            try:
+                page.wait_for_selector(".product-details__listings", timeout=LISTING_PAGE_WAIT_MS)
+            except Exception as e:
+                art = _save_debug(page, "pages-container-missing")
+                return {"product_id": str(product_id), "url": page.url,
+                        "total_pages": None, "error": "listings_container_not_found", "reason": str(e),
+                        "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            last_page = _extract_last_page_number(page)
+
+            return {
+                "product_id": str(product_id),
+                "url": page.url,
+                "total_pages": last_page,
+                "login": login_info,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "elapsed_ms": int((time.time() - t0) * 1000)
+            }
+        finally:
+            context.close(); browser.close()
+
+def fetch_active_listings_in_page(product_id: str, target_page: int) -> dict:
+    """Fetch active listings from a specific page number using optimized navigation."""
+    t0 = time.time()
+    url = f"https://www.tcgplayer.com/product/{product_id}"
+    with sync_playwright() as p:
+        browser, context = _new_context(p, use_saved_state=True)
+        login_info = _ensure_logged_in(context)
+        page = context.new_page()
+        try:
+            try:
+                _goto_with_retries(page, url); _click_consent_if_present(page)
+            except Exception as e:
+                art = _save_debug(page, "listings-page-nav-failed")
+                return {"product_id": str(product_id), "url": url, "target_page": target_page,
+                        "listings": [], "error": "timeout_nav", "reason": str(e),
+                        "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            if not _is_logged_in(page) and not FORCE_STATE_ONLY and os.getenv("TCG_EMAIL") and os.getenv("TCG_PASSWORD"):
+                li2 = _do_login_flow(context, capture=True)
+                login_info = {"first": login_info, "retry": li2}
+                page = context.new_page(); _goto_with_retries(page, url); _click_consent_if_present(page)
+
+            err = _anti_bot_check(page)
+            if err:
+                art = _save_debug(page, "listings-page-challenge")
+                return {"product_id": str(product_id), "url": url, "target_page": target_page,
+                        "listings": [], "error": err, "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            try:
+                page.wait_for_selector(".product-details__listings", timeout=LISTING_PAGE_WAIT_MS)
+            except Exception as e:
+                art = _save_debug(page, "listings-page-container-missing")
+                return {"product_id": str(product_id), "url": page.url, "target_page": target_page,
+                        "listings": [], "error": "listings_container_not_found", "reason": str(e),
+                        "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            # Get the last page number
+            last_page = _extract_last_page_number(page)
+
+            # Validate target page
+            if target_page < 1:
+                return {"product_id": str(product_id), "url": page.url, "target_page": target_page,
+                        "listings": [], "error": "invalid_page_number", "reason": "Page number must be >= 1",
+                        "login": login_info, "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            if target_page > last_page:
+                return {"product_id": str(product_id), "url": page.url, "target_page": target_page,
+                        "listings": [], "error": "page_out_of_range",
+                        "reason": f"Target page {target_page} exceeds last page {last_page}",
+                        "total_pages": last_page, "login": login_info,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            # Navigate to target page using optimized navigation
+            if not _navigate_to_page_number(page, url, target_page, last_page):
+                art = _save_debug(page, "listings-page-navigation-failed")
+                return {"product_id": str(product_id), "url": page.url, "target_page": target_page,
+                        "listings": [], "error": "navigation_failed",
+                        "reason": f"Failed to navigate to page {target_page}",
+                        "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            # Verify we're on the correct page
+            current_page = _detect_current_page(page)
+            if current_page != target_page:
+                art = _save_debug(page, "listings-page-mismatch")
+                return {"product_id": str(product_id), "url": page.url, "target_page": target_page,
+                        "current_page": current_page, "listings": [],
+                        "error": "page_mismatch",
+                        "reason": f"Navigated to page {current_page} instead of {target_page}",
+                        "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            # Scrape listings from current page
+            page_listings = _scrape_active_listings_from_dom(page)
+
+            # Remove internal _key field from listings
+            listings = []
+            for listing in page_listings:
+                listing.pop("_key", None)
+                listings.append(listing)
+
+            return {
+                "product_id": str(product_id),
+                "url": page.url,
+                "target_page": target_page,
+                "current_page": current_page,
+                "total_pages": last_page,
+                "listings": listings,
+                "listings_count": len(listings),
+                "login": login_info,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "elapsed_ms": int((time.time() - t0) * 1000)
+            }
         finally:
             context.close(); browser.close()
 
