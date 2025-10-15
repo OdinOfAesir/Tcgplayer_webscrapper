@@ -612,16 +612,95 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
     return processed
 
 def _go_to_next_listings_page(page: Page) -> bool:
+    candidate_selector = None
+    try:
+        candidate_selector = page.evaluate(
+            """
+            () => {
+                const root = document.querySelector('.tcg-pagination.search-pagination');
+                if (!root) { return null; }
+                root.querySelectorAll('[data-codex-next]').forEach(el => el.removeAttribute('data-codex-next'));
+                const mark = (el) => {
+                    if (!el) { return null; }
+                    el.setAttribute('data-codex-next', 'true');
+                    return '[data-codex-next="true"]';
+                };
+                const isDisabled = (el) => {
+                    if (!el) { return true; }
+                    if (el.hasAttribute('disabled')) { return true; }
+                    const aria = (el.getAttribute('aria-disabled') || '').toLowerCase();
+                    if (aria === 'true' || aria === '1') { return true; }
+                    const cls = (el.getAttribute('class') || '').toLowerCase();
+                    if (cls.includes('disabled')) { return true; }
+                    return false;
+                };
+
+                const direct = root.querySelector('[rel="next"]');
+                if (direct && !isDisabled(direct)) { return mark(direct); }
+
+                const ariaNext = Array.from(root.querySelectorAll('a[aria-label], button[aria-label]')).find((el) => {
+                    const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                    return label.includes('next') && !isDisabled(el);
+                });
+                if (ariaNext) { return mark(ariaNext); }
+
+                const current = root.querySelector('[aria-current="page"], [aria-current="true"], .is-current, .active');
+                const start = current ? (current.closest('li') || current.parentElement) : null;
+                let cursor = start ? start.nextElementSibling : null;
+                while (cursor) {
+                    const clickable = cursor.querySelector('a, button');
+                    if (clickable && !isDisabled(clickable)) {
+                        return mark(clickable);
+                    }
+                    cursor = cursor.nextElementSibling;
+                }
+
+                const textMatch = Array.from(root.querySelectorAll('button, a')).find((el) => {
+                    if (isDisabled(el)) { return false; }
+                    const text = (el.textContent || '').trim().toLowerCase();
+                    if (!text) { return false; }
+                    return text === 'next'
+                        || text.startsWith('next ')
+                        || text.endsWith(' next')
+                        || text.includes('load more')
+                        || text.includes('show more')
+                        || text.includes('more results');
+                });
+                if (textMatch) { return mark(textMatch); }
+
+                return null;
+            }
+            """
+        )
+    except Exception:
+        candidate_selector = None
+
     selectors = [
-        '.tcg-pagination.search-pagination a[aria-label*="Next"]:not([aria-disabled="true"])',
-        '.tcg-pagination.search-pagination button[aria-label*="Next"]:not([disabled])',
-        '.tcg-pagination.search-pagination a:has-text("Next")',
-        '.tcg-pagination.search-pagination button:has-text("Next")',
-        '.tcg-pagination.search-pagination li.next a:not(.disabled)',
-        'button:has-text("Load More")',
+        candidate_selector,
+        '.tcg-pagination.search-pagination a[rel="next"]',
+        '.tcg-pagination.search-pagination a[aria-label*="Next"]',
+        '.tcg-pagination.search-pagination button[aria-label*="Next"]',
+        '.tcg-pagination.search-pagination [aria-current="page"] ~ li a',
+        '.tcg-pagination.search-pagination [aria-current="page"] ~ li button',
+        '.tcg-pagination.search-pagination li.next a',
+        '.tcg-pagination.search-pagination li.next button',
+        '.tcg-pagination.search-pagination button',
+        '.tcg-pagination.search-pagination a',
         '[data-testid*="load-more"]',
-        'button:has-text("Show More")'
     ]
+
+    selectors = [sel for sel in selectors if sel]
+
+    try:
+        page.locator('.tcg-pagination.search-pagination').first.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        try:
+            page.evaluate(
+                "() => { const el = document.querySelector('.tcg-pagination.search-pagination'); if (el) { el.scrollIntoView({behavior: 'instant', block: 'center'}); } }"
+            )
+        except Exception:
+            pass
+
     try:
         prev_html = page.evaluate(
             "() => { const el = document.querySelector('.product-details__listings'); return el ? el.innerHTML : null; }"
@@ -640,18 +719,11 @@ def _go_to_next_listings_page(page: Page) -> bool:
         except Exception:
             continue
 
-        disabled_attr = ""
-        class_attr = ""
         try:
             disabled_attr = (loc.get_attribute("aria-disabled") or "").lower()
             class_attr = (loc.get_attribute("class") or "").lower()
-        except Exception:
-            pass
-        if disabled_attr in ("true", "1"):
-            continue
-        if "disabled" in class_attr:
-            continue
-        try:
+            if disabled_attr in ("true", "1") or "disabled" in class_attr:
+                continue
             if hasattr(loc, "is_enabled") and not loc.is_enabled():
                 continue
         except Exception:
@@ -665,7 +737,18 @@ def _go_to_next_listings_page(page: Page) -> bool:
         try:
             loc.click(timeout=3000)
         except Exception:
+            if sel == '[data-codex-next="true"]':
+                try:
+                    page.evaluate("() => document.querySelectorAll('[data-codex-next]').forEach(el => el.removeAttribute('data-codex-next'))")
+                except Exception:
+                    pass
             continue
+
+        if sel == '[data-codex-next="true"]':
+            try:
+                page.evaluate("() => document.querySelectorAll('[data-codex-next]').forEach(el => el.removeAttribute('data-codex-next'))")
+            except Exception:
+                pass
 
         waited = False
         if prev_html is not None:
@@ -889,6 +972,7 @@ def fetch_active_listings(product_id: str) -> dict:
             aggregated: List[Dict[str, Any]] = []
             seen_listing_keys: Set[str] = set()
             seen_signatures: Set[str] = set()
+            seen_page_urls: Set[str] = set()
             pages_inspected = 0
 
             while pages_inspected < MAX_LISTING_PAGES:
@@ -897,6 +981,13 @@ def fetch_active_listings(product_id: str) -> dict:
                     page.wait_for_selector(".product-details__listings", timeout=LISTING_PAGE_WAIT_MS)
                 except Exception:
                     break
+
+                current_url = page.url
+                if current_url:
+                    current_url = str(current_url)
+                    if current_url in seen_page_urls:
+                        break
+                    seen_page_urls.add(current_url)
 
                 try:
                     signature = page.evaluate(
