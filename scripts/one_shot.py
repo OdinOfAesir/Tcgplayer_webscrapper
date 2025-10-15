@@ -8,8 +8,7 @@ import uuid
 import json
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set
-from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
-import hashlib
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page
@@ -49,7 +48,7 @@ USER_AGENT       = os.getenv("USER_AGENT") or (
 NAV_PLATFORM = os.getenv("NAV_PLATFORM", "MacIntel")
 NAV_LANGS    = os.getenv("NAV_LANGS", "en-US,en")
 MAX_LISTING_PAGES   = _env_int("LISTING_MAX_PAGES", 20)
-LISTING_PAGE_WAIT_MS = _env_int("LISTING_PAGE_WAIT_MS", 30000)
+LISTING_PAGE_WAIT_MS = _env_int("LISTING_PAGE_WAIT_MS", 20000)
 
 # ---------- proxy ----------
 def _parse_proxy_env():
@@ -612,96 +611,17 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
 
     return processed
 
-def _normalize_pagination_target(current_url: str, target: Optional[str]) -> Optional[str]:
-    if not target:
-        return None
-
-def _wait_for_listings_refresh(page: Page,
-                               prev_html: Optional[str],
-                               prev_label: Optional[str],
-                               prev_url: str,
-                               timeout_ms: int) -> bool:
-    try:
-        page.wait_for_function(
-            """
-            (arg) => {
-                const listings = document.querySelector('.product-details__listings');
-                if (!listings) { return false; }
-                const html = listings.innerHTML || '';
-                const pager = document.querySelector('.tcg-pagination.search-pagination [aria-current="page"], .tcg-pagination.search-pagination [aria-current="true"], .tcg-pagination.search-pagination .is-current, .tcg-pagination.search-pagination .active');
-                const label = pager ? (pager.textContent || '').trim() : null;
-
-                if (!arg.prev_html) {
-                    return html.length > 0;
-                }
-                if (html && html !== arg.prev_html) {
-                    return true;
-                }
-                if (label && arg.prev_label && label !== arg.prev_label) {
-                    return true;
-                }
-                if (window.location.href !== arg.prev_url) {
-                    return true;
-                }
-                return false;
-            }
-            """,
-            {"prev_html": prev_html or "", "prev_label": prev_label or "", "prev_url": prev_url or ""},
-            timeout=timeout_ms
-        )
-        return True
-    except Exception:
-        return False
-    target = target.strip()
-    if not target or target.lower().startswith("javascript"):
-        return None
-    try:
-        current_parts = urlparse(current_url)
-        joined = urljoin(current_url, target)
-        dest_parts = urlparse(joined)
-
-        if not dest_parts.netloc:
-            dest_parts = dest_parts._replace(netloc=current_parts.netloc, scheme=current_parts.scheme)
-        if not dest_parts.path:
-            dest_parts = dest_parts._replace(path=current_parts.path)
-
-        current_q = {k: v for k, v in parse_qsl(current_parts.query, keep_blank_values=True)}
-        dest_q = {k: v for k, v in parse_qsl(dest_parts.query, keep_blank_values=True)}
-        merged_q = current_q
-        merged_q.update(dest_q)
-
-        new_query = urlencode(merged_q, doseq=False)
-        dest_parts = dest_parts._replace(query=new_query)
-
-        return dest_parts.geturl()
-    except Exception:
-        return None
-
 def _go_to_next_listings_page(page: Page) -> bool:
-    try:
-        page.evaluate(
-            "() => { const root = document.querySelector('.tcg-pagination.search-pagination'); if (root) { root.querySelectorAll('[data-codex-next-marker]').forEach(el => el.removeAttribute('data-codex-next-marker')); } }"
-        )
-    except Exception:
-        pass
-
-    try:
-        prev_url = page.url
-    except Exception:
-        prev_url = ""
-    try:
-        prev_label = page.evaluate(
-            """
-            () => {
-                const root = document.querySelector('.tcg-pagination.search-pagination');
-                if (!root) { return null; }
-                const current = root.querySelector('[aria-current="page"], [aria-current="true"], .is-current, .active');
-                return current ? (current.textContent || '').trim() : null;
-            }
-            """
-        )
-    except Exception:
-        prev_label = None
+    selectors = [
+        '.tcg-pagination.search-pagination a[aria-label*="Next"]:not([aria-disabled="true"])',
+        '.tcg-pagination.search-pagination button[aria-label*="Next"]:not([disabled])',
+        '.tcg-pagination.search-pagination a:has-text("Next")',
+        '.tcg-pagination.search-pagination button:has-text("Next")',
+        '.tcg-pagination.search-pagination li.next a:not(.disabled)',
+        'button:has-text("Load More")',
+        '[data-testid*="load-more"]',
+        'button:has-text("Show More")'
+    ]
     try:
         prev_html = page.evaluate(
             "() => { const el = document.querySelector('.product-details__listings'); return el ? el.innerHTML : null; }"
@@ -709,171 +629,7 @@ def _go_to_next_listings_page(page: Page) -> bool:
     except Exception:
         prev_html = None
 
-    action = None
-    try:
-        action = page.evaluate(
-            """
-            () => {
-                const root = document.querySelector('.tcg-pagination.search-pagination');
-                if (!root) { return null; }
-
-                const isDisabled = (el) => {
-                    if (!el) { return true; }
-                    if (el.hasAttribute('disabled')) { return true; }
-                    const aria = (el.getAttribute('aria-disabled') || '').toLowerCase();
-                    if (aria === 'true' || aria === '1') { return true; }
-                    const cls = (el.getAttribute('class') || '').toLowerCase();
-                    if (cls.includes('disabled')) { return true; }
-                    return false;
-                };
-
-                const parseNumber = (value) => {
-                    const txt = (value || '').replace(/[^0-9]/g, '');
-                    if (!txt) { return null; }
-                    const num = parseInt(txt, 10);
-                    return Number.isNaN(num) ? null : num;
-                };
-
-                const candidates = [];
-                const push = (el, score) => {
-                    if (!el || isDisabled(el)) { return; }
-                    candidates.push({ el, score });
-                };
-
-                const direct = root.querySelector('[rel="next"]');
-                if (direct) { push(direct, 0); }
-
-                Array.from(root.querySelectorAll('a[aria-label], button[aria-label]')).forEach((el) => {
-                    const label = (el.getAttribute('aria-label') || '').toLowerCase();
-                    if (label.includes('next')) { push(el, 1); }
-                });
-
-                const current = root.querySelector('[aria-current="page"], [aria-current="true"], .is-current, .active');
-                const currentNum = parseNumber(current ? current.textContent : null);
-                if (currentNum !== null) {
-                    Array.from(root.querySelectorAll('a, button')).forEach((el) => {
-                        const num = parseNumber(el.textContent);
-                        if (num !== null && num === currentNum + 1) {
-                            push(el, 2);
-                        }
-                    });
-                } else if (current) {
-                    const start = current.closest('li') || current.parentElement;
-                    let cursor = start ? start.nextElementSibling : current.nextElementSibling;
-                    while (cursor) {
-                        const clickable = cursor.querySelector('a, button');
-                        if (clickable) {
-                            push(clickable, 3);
-                            break;
-                        }
-                        cursor = cursor.nextElementSibling;
-                    }
-                }
-
-                if (!candidates.length) {
-                    Array.from(root.querySelectorAll('button, a')).forEach((el) => {
-                        const text = (el.textContent || '').trim().toLowerCase();
-                        if (!text) { return; }
-                        if (text.includes('next') || text.includes('load more') || text.includes('show more') || text.includes('more results')) {
-                            push(el, 4);
-                        }
-                    });
-                }
-
-                if (!candidates.length) { return null; }
-
-                candidates.sort((a, b) => a.score - b.score);
-                const pick = candidates[0].el;
-
-                const attrCandidates = [
-                    pick.getAttribute('data-url'),
-                    pick.getAttribute('data-page-url'),
-                    pick.getAttribute('href'),
-                ];
-
-                for (const candidate of attrCandidates) {
-                    if (candidate && candidate.trim() && candidate.trim() !== '#') {
-                        return { kind: 'url', href: candidate.trim() };
-                    }
-                }
-
-                const dataPage = pick.getAttribute('data-page') || pick.getAttribute('data-page-number') || pick.getAttribute('data-page-index');
-                if (dataPage && dataPage.trim()) {
-                    return { kind: 'url', href: '?page=' + dataPage.trim() };
-                }
-
-                const markerAttr = 'data-codex-next-marker';
-                if (!pick.getAttribute(markerAttr)) {
-                    pick.setAttribute(markerAttr, 'm-' + Math.random().toString(16).slice(2));
-                }
-                return { kind: 'click', selector: '[' + markerAttr + '="' + pick.getAttribute(markerAttr) + '"]' };
-            }
-            """
-        )
-    except Exception:
-        action = None
-
-    selectors: List[str] = []
-    if isinstance(action, dict):
-        kind = action.get("kind")
-        if kind == "url":
-            normalized = _normalize_pagination_target(prev_url, action.get("href"))
-            if normalized:
-                try:
-                    page.goto(normalized, wait_until="load", timeout=max(NAV_TIMEOUT_MS, LISTING_PAGE_WAIT_MS))
-                except Exception:
-                    pass
-                else:
-                    refreshed = _wait_for_listings_refresh(page, prev_html, prev_label, prev_url, LISTING_PAGE_WAIT_MS)
-                    if not refreshed and page.url and page.url != prev_url:
-                        refreshed = True
-                    try:
-                        page.evaluate(
-                            "() => { const root = document.querySelector('.tcg-pagination.search-pagination'); if (root) { root.querySelectorAll('[data-codex-next-marker]').forEach(el => el.removeAttribute('data-codex-next-marker')); } }"
-                        )
-                    except Exception:
-                        pass
-                    if refreshed:
-                        return True
-        elif kind == "click":
-            selector = action.get("selector")
-            if isinstance(selector, str) and selector.strip():
-                selectors.append(selector.strip())
-
-    selectors.extend([
-        '.tcg-pagination.search-pagination a[rel="next"]',
-        '.tcg-pagination.search-pagination a[aria-label*="Next"]',
-        '.tcg-pagination.search-pagination button[aria-label*="Next"]',
-        '.tcg-pagination.search-pagination [aria-current="page"] ~ li a',
-        '.tcg-pagination.search-pagination [aria-current="page"] ~ li button',
-        '.tcg-pagination.search-pagination li.next a',
-        '.tcg-pagination.search-pagination li.next button',
-        '[data-testid*="load-more"]',
-        'button:has-text("Next")',
-        'a:has-text("Next")',
-        'button:has-text("Load More")',
-        'button:has-text("Show More")',
-        'button:has-text("More Results")',
-    ])
-
-    seen_selectors = set()
-    ordered_selectors = []
     for sel in selectors:
-        if sel and sel not in seen_selectors:
-            seen_selectors.add(sel)
-            ordered_selectors.append(sel)
-
-    try:
-        page.locator('.tcg-pagination.search-pagination').first.scroll_into_view_if_needed(timeout=2000)
-    except Exception:
-        try:
-            page.evaluate(
-                "() => { const el = document.querySelector('.tcg-pagination.search-pagination'); if (el) { el.scrollIntoView({behavior: 'instant', block: 'center'}); } }"
-            )
-        except Exception:
-            pass
-
-    for sel in ordered_selectors:
         try:
             loc = page.locator(sel).first
         except Exception:
@@ -884,11 +640,18 @@ def _go_to_next_listings_page(page: Page) -> bool:
         except Exception:
             continue
 
+        disabled_attr = ""
+        class_attr = ""
         try:
             disabled_attr = (loc.get_attribute("aria-disabled") or "").lower()
             class_attr = (loc.get_attribute("class") or "").lower()
-            if disabled_attr in ("true", "1") or "disabled" in class_attr:
-                continue
+        except Exception:
+            pass
+        if disabled_attr in ("true", "1"):
+            continue
+        if "disabled" in class_attr:
+            continue
+        try:
             if hasattr(loc, "is_enabled") and not loc.is_enabled():
                 continue
         except Exception:
@@ -900,32 +663,29 @@ def _go_to_next_listings_page(page: Page) -> bool:
             pass
 
         try:
-            loc.click(timeout=5000)
+            loc.click(timeout=3000)
         except Exception:
             continue
 
-        refreshed = _wait_for_listings_refresh(page, prev_html, prev_label, prev_url, LISTING_PAGE_WAIT_MS)
-        if not refreshed:
+        waited = False
+        if prev_html is not None:
             try:
-                page.wait_for_load_state("networkidle", timeout=min(20000, NAV_TIMEOUT_MS))
+                page.wait_for_function(
+                    "(arg) => { const el = document.querySelector(arg.selector); if (!el) { return false; } return el.innerHTML !== arg.prev; }",
+                    {"selector": ".product-details__listings", "prev": prev_html},
+                    timeout=LISTING_PAGE_WAIT_MS
+                )
+                waited = True
             except Exception:
                 pass
+
+        if not waited:
             try:
-                page.wait_for_timeout(800)
+                page.wait_for_load_state("networkidle", timeout=min(15000, NAV_TIMEOUT_MS))
             except Exception:
                 pass
-            if page.url and page.url != prev_url:
-                refreshed = True
-
-        try:
-            page.evaluate(
-                "() => { const root = document.querySelector('.tcg-pagination.search-pagination'); if (root) { root.querySelectorAll('[data-codex-next-marker]').forEach(el => el.removeAttribute('data-codex-next-marker')); } }"
-            )
-        except Exception:
-            pass
-
-        if refreshed:
-            return True
+            page.wait_for_timeout(800)
+        return True
 
     return False
 
@@ -1132,26 +892,23 @@ def fetch_active_listings(product_id: str) -> dict:
             pages_inspected = 0
 
             while pages_inspected < MAX_LISTING_PAGES:
+                pages_inspected += 1
                 try:
                     page.wait_for_selector(".product-details__listings", timeout=LISTING_PAGE_WAIT_MS)
                 except Exception:
                     break
 
                 try:
-                    listings_html = page.evaluate(
-                        "() => { const el = document.querySelector('.product-details__listings'); return el ? el.outerHTML : null; }"
+                    signature = page.evaluate(
+                        "() => { const el = document.querySelector('.product-details__listings'); return el ? el.innerHTML.slice(0, 4096) : null; }"
                     )
                 except Exception:
-                    listings_html = None
+                    signature = None
 
-                if not listings_html:
+                if signature and signature in seen_signatures:
                     break
-
-                signature = hashlib.sha1(listings_html.encode("utf-8", "ignore")).hexdigest()
-                if signature in seen_signatures:
-                    break
-                seen_signatures.add(signature)
-                pages_inspected += 1
+                if signature:
+                    seen_signatures.add(signature)
 
                 page_listings = _scrape_active_listings_from_dom(page)
                 for listing in page_listings:
