@@ -8,7 +8,8 @@ import uuid
 import json
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Set
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, parse_qsl, urlencode
+import hashlib
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page
@@ -611,6 +612,71 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
 
     return processed
 
+def _normalize_pagination_target(current_url: str, target: Optional[str]) -> Optional[str]:
+    if not target:
+        return None
+
+def _wait_for_listings_refresh(page: Page,
+                               prev_html: Optional[str],
+                               prev_label: Optional[str],
+                               prev_url: str,
+                               timeout_ms: int) -> bool:
+    try:
+        page.wait_for_function(
+            """
+            (arg) => {
+                const listings = document.querySelector('.product-details__listings');
+                if (!listings) { return false; }
+                const html = listings.innerHTML || '';
+                const pager = document.querySelector('.tcg-pagination.search-pagination [aria-current="page"], .tcg-pagination.search-pagination [aria-current="true"], .tcg-pagination.search-pagination .is-current, .tcg-pagination.search-pagination .active');
+                const label = pager ? (pager.textContent || '').trim() : null;
+
+                if (!arg.prev_html) {
+                    return html.length > 0;
+                }
+                if (html && html !== arg.prev_html) {
+                    return true;
+                }
+                if (label && arg.prev_label && label !== arg.prev_label) {
+                    return true;
+                }
+                if (window.location.href !== arg.prev_url) {
+                    return true;
+                }
+                return false;
+            }
+            """,
+            {"prev_html": prev_html or "", "prev_label": prev_label or "", "prev_url": prev_url or ""},
+            timeout=timeout_ms
+        )
+        return True
+    except Exception:
+        return False
+    target = target.strip()
+    if not target or target.lower().startswith("javascript"):
+        return None
+    try:
+        current_parts = urlparse(current_url)
+        joined = urljoin(current_url, target)
+        dest_parts = urlparse(joined)
+
+        if not dest_parts.netloc:
+            dest_parts = dest_parts._replace(netloc=current_parts.netloc, scheme=current_parts.scheme)
+        if not dest_parts.path:
+            dest_parts = dest_parts._replace(path=current_parts.path)
+
+        current_q = {k: v for k, v in parse_qsl(current_parts.query, keep_blank_values=True)}
+        dest_q = {k: v for k, v in parse_qsl(dest_parts.query, keep_blank_values=True)}
+        merged_q = current_q
+        merged_q.update(dest_q)
+
+        new_query = urlencode(merged_q, doseq=False)
+        dest_parts = dest_parts._replace(query=new_query)
+
+        return dest_parts.geturl()
+    except Exception:
+        return None
+
 def _go_to_next_listings_page(page: Page) -> bool:
     try:
         page.evaluate(
@@ -618,6 +684,30 @@ def _go_to_next_listings_page(page: Page) -> bool:
         )
     except Exception:
         pass
+
+    try:
+        prev_url = page.url
+    except Exception:
+        prev_url = ""
+    try:
+        prev_label = page.evaluate(
+            """
+            () => {
+                const root = document.querySelector('.tcg-pagination.search-pagination');
+                if (!root) { return null; }
+                const current = root.querySelector('[aria-current="page"], [aria-current="true"], .is-current, .active');
+                return current ? (current.textContent || '').trim() : null;
+            }
+            """
+        )
+    except Exception:
+        prev_label = None
+    try:
+        prev_html = page.evaluate(
+            "() => { const el = document.querySelector('.product-details__listings'); return el ? el.innerHTML : null; }"
+        )
+    except Exception:
+        prev_html = None
 
     action = None
     try:
@@ -695,12 +785,6 @@ def _go_to_next_listings_page(page: Page) -> bool:
                 candidates.sort((a, b) => a.score - b.score);
                 const pick = candidates[0].el;
 
-                const toAbsolute = (href) => {
-                    if (!href) { return null; }
-                    try { return new URL(href, window.location.href).href; }
-                    catch (err) { return href; }
-                };
-
                 const attrCandidates = [
                     pick.getAttribute('data-url'),
                     pick.getAttribute('data-page-url'),
@@ -709,15 +793,13 @@ def _go_to_next_listings_page(page: Page) -> bool:
 
                 for (const candidate of attrCandidates) {
                     if (candidate && candidate.trim() && candidate.trim() !== '#') {
-                        const absolute = toAbsolute(candidate.trim());
-                        return { kind: 'url', href: candidate.trim(), absolute };
+                        return { kind: 'url', href: candidate.trim() };
                     }
                 }
 
                 const dataPage = pick.getAttribute('data-page') || pick.getAttribute('data-page-number') || pick.getAttribute('data-page-index');
                 if (dataPage && dataPage.trim()) {
-                    const query = '?page=' + dataPage.trim();
-                    return { kind: 'url', href: query, absolute: toAbsolute(query) };
+                    return { kind: 'url', href: '?page=' + dataPage.trim() };
                 }
 
                 const markerAttr = 'data-codex-next-marker';
@@ -735,33 +817,24 @@ def _go_to_next_listings_page(page: Page) -> bool:
     if isinstance(action, dict):
         kind = action.get("kind")
         if kind == "url":
-            target = action.get("absolute") or action.get("href")
-            if isinstance(target, str):
-                target = target.strip()
-            else:
-                target = None
-            if target:
+            normalized = _normalize_pagination_target(prev_url, action.get("href"))
+            if normalized:
                 try:
-                    target_url = urljoin(page.url, target) if not target.lower().startswith("http") else target
-                except Exception:
-                    target_url = target
-                try:
-                    page.goto(target_url, wait_until="load", timeout=max(NAV_TIMEOUT_MS, LISTING_PAGE_WAIT_MS))
+                    page.goto(normalized, wait_until="load", timeout=max(NAV_TIMEOUT_MS, LISTING_PAGE_WAIT_MS))
                 except Exception:
                     pass
                 else:
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=min(20000, NAV_TIMEOUT_MS))
-                    except Exception:
-                        pass
-                    page.wait_for_timeout(600)
+                    refreshed = _wait_for_listings_refresh(page, prev_html, prev_label, prev_url, LISTING_PAGE_WAIT_MS)
+                    if not refreshed and page.url and page.url != prev_url:
+                        refreshed = True
                     try:
                         page.evaluate(
                             "() => { const root = document.querySelector('.tcg-pagination.search-pagination'); if (root) { root.querySelectorAll('[data-codex-next-marker]').forEach(el => el.removeAttribute('data-codex-next-marker')); } }"
                         )
                     except Exception:
                         pass
-                    return True
+                    if refreshed:
+                        return True
         elif kind == "click":
             selector = action.get("selector")
             if isinstance(selector, str) and selector.strip():
@@ -800,13 +873,6 @@ def _go_to_next_listings_page(page: Page) -> bool:
         except Exception:
             pass
 
-    try:
-        prev_html = page.evaluate(
-            "() => { const el = document.querySelector('.product-details__listings'); return el ? el.innerHTML : null; }"
-        )
-    except Exception:
-        prev_html = None
-
     for sel in ordered_selectors:
         try:
             loc = page.locator(sel).first
@@ -834,28 +900,22 @@ def _go_to_next_listings_page(page: Page) -> bool:
             pass
 
         try:
-            loc.click(timeout=4000)
+            loc.click(timeout=5000)
         except Exception:
             continue
 
-        waited = False
-        if prev_html is not None:
-            try:
-                page.wait_for_function(
-                    "(arg) => { const el = document.querySelector(arg.selector); if (!el) { return false; } return el.innerHTML !== arg.prev; }",
-                    {"selector": ".product-details__listings", "prev": prev_html},
-                    timeout=LISTING_PAGE_WAIT_MS
-                )
-                waited = True
-            except Exception:
-                pass
-
-        if not waited:
+        refreshed = _wait_for_listings_refresh(page, prev_html, prev_label, prev_url, LISTING_PAGE_WAIT_MS)
+        if not refreshed:
             try:
                 page.wait_for_load_state("networkidle", timeout=min(20000, NAV_TIMEOUT_MS))
             except Exception:
                 pass
-            page.wait_for_timeout(800)
+            try:
+                page.wait_for_timeout(800)
+            except Exception:
+                pass
+            if page.url and page.url != prev_url:
+                refreshed = True
 
         try:
             page.evaluate(
@@ -864,10 +924,10 @@ def _go_to_next_listings_page(page: Page) -> bool:
         except Exception:
             pass
 
-        return True
+        if refreshed:
+            return True
 
     return False
-
 
 def _open_snapshot_dialog(page: Page, wait_ms: int) -> None:
     _slow_scroll(page, steps=14)
@@ -1072,23 +1132,26 @@ def fetch_active_listings(product_id: str) -> dict:
             pages_inspected = 0
 
             while pages_inspected < MAX_LISTING_PAGES:
-                pages_inspected += 1
                 try:
                     page.wait_for_selector(".product-details__listings", timeout=LISTING_PAGE_WAIT_MS)
                 except Exception:
                     break
 
                 try:
-                    signature = page.evaluate(
-                        "() => { const el = document.querySelector('.product-details__listings'); return el ? el.innerHTML.slice(0, 4096) : null; }"
+                    listings_html = page.evaluate(
+                        "() => { const el = document.querySelector('.product-details__listings'); return el ? el.outerHTML : null; }"
                     )
                 except Exception:
-                    signature = None
+                    listings_html = None
 
-                if signature and signature in seen_signatures:
+                if not listings_html:
                     break
-                if signature:
-                    seen_signatures.add(signature)
+
+                signature = hashlib.sha1(listings_html.encode("utf-8", "ignore")).hexdigest()
+                if signature in seen_signatures:
+                    break
+                seen_signatures.add(signature)
+                pages_inspected += 1
 
                 page_listings = _scrape_active_listings_from_dom(page)
                 for listing in page_listings:
