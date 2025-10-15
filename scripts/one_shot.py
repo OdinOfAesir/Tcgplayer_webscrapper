@@ -449,37 +449,36 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
                     const root = el.closest('[data-testid="listing-item"], [data-testid="listing-card"], li, article, .listing-item, .product-listing, .product-details__listing');
                     return root || el.parentElement;
                 };
-
-                const findShipping = (priceEl) => {
+                const findShippingSpan = (priceEl) => {
                     if (!priceEl) {
                         return null;
                     }
-                    let sibling = priceEl.nextSibling;
+                    let sibling = priceEl.nextElementSibling;
                     while (sibling) {
-                        if (sibling.nodeType === Node.TEXT_NODE) {
-                            sibling = sibling.nextSibling;
-                            continue;
+                        if (sibling.tagName && sibling.tagName.toLowerCase() === 'span') {
+                            return sibling;
                         }
-                        if (sibling.nodeType === Node.ELEMENT_NODE) {
-                            const element = sibling;
-                            if (element.tagName && element.tagName.toLowerCase() === 'span') {
-                                if (!element.className || element.className.toLowerCase().includes('shipping')) {
-                                    return element;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    const parent = priceEl.parentElement;
-                    if (parent) {
-                        const candidates = parent.querySelectorAll('span:not([class]), span[class*="shipping"], span[class*="Shipping"]');
-                        for (const cand of candidates) {
-                            if (cand !== priceEl) {
-                                return cand;
-                            }
-                        }
+                        sibling = sibling.nextElementSibling;
                     }
                     return null;
+                };
+                const readShippingInfo = (priceEl) => {
+                    const span = findShippingSpan(priceEl);
+                    if (!span) {
+                        return { text: null, hasAnchor: false };
+                    }
+                    const hasAnchor = !!span.querySelector('a');
+                    const text = (span.textContent || '').trim();
+                    return { text, hasAnchor };
+                };
+                const extractAdditionalInfo = (el) => {
+                    if (!el) {
+                        return null;
+                    }
+                    const clone = el.cloneNode(true);
+                    clone.querySelectorAll('a').forEach((link) => link.remove());
+                    const text = (clone.textContent || '').replace(/\\s+/g, ' ').trim();
+                    return text || null;
                 };
 
                 const priceNodes = Array.from(container.querySelectorAll('.listing-item__listing-data__info__price'));
@@ -500,7 +499,7 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
                     }
                     seenKeys.add(key);
                     const conditionEl = root.querySelector('.listing-item__listing-data__info__condition');
-                    const shippingEl = findShipping(priceEl);
+                    const shippingInfo = readShippingInfo(priceEl);
                     const quantityEl = root.querySelector('.add-to-cart__available');
                     const additionalInfoEl = root.querySelector('.listing-item__listing-data__listo');
                     const sellerEl = root.querySelector('.seller-info a');
@@ -509,10 +508,11 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
                         condition: conditionEl ? conditionEl.textContent.trim() : null,
                         priceText: priceEl.textContent.trim(),
                         priceContext: priceEl.parentElement ? priceEl.parentElement.textContent.trim() : priceEl.textContent.trim(),
-                        shippingText: shippingEl ? shippingEl.textContent.trim() : null,
+                        shippingText: shippingInfo.text,
+                        shippingHasAnchor: shippingInfo.hasAnchor,
                         sellerName: sellerEl ? sellerEl.textContent.trim() : null,
                         quantityText: quantityEl ? quantityEl.textContent.trim() : null,
-                        additionalInfo: additionalInfoEl ? additionalInfoEl.textContent.trim() : null
+                        additionalInfo: extractAdditionalInfo(additionalInfoEl)
                     });
                 }
 
@@ -535,9 +535,7 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
                         }
                         seenKeys.add(key);
                         const conditionEl = node.querySelector('.listing-item__listing-data__info__condition');
-                        const shippingEl = priceEl.nextElementSibling && priceEl.nextElementSibling.tagName && priceEl.nextElementSibling.tagName.toLowerCase() === 'span'
-                            ? priceEl.nextElementSibling
-                            : null;
+                        const shippingInfo = readShippingInfo(priceEl);
                         const quantityEl = node.querySelector('.add-to-cart__available');
                         const additionalInfoEl = node.querySelector('.listing-item__listing-data__listo');
                         const sellerEl = node.querySelector('.seller-info a');
@@ -546,10 +544,11 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
                             condition: conditionEl ? conditionEl.textContent.trim() : null,
                             priceText: priceEl.textContent.trim(),
                             priceContext: priceEl.parentElement ? priceEl.parentElement.textContent.trim() : priceEl.textContent.trim(),
-                            shippingText: shippingEl ? shippingEl.textContent.trim() : null,
+                            shippingText: shippingInfo.text,
+                            shippingHasAnchor: shippingInfo.hasAnchor,
                             sellerName: sellerEl ? sellerEl.textContent.trim() : null,
                             quantityText: quantityEl ? quantityEl.textContent.trim() : null,
-                            additionalInfo: additionalInfoEl ? additionalInfoEl.textContent.trim() : null
+                            additionalInfo: extractAdditionalInfo(additionalInfoEl)
                         });
                     }
                 }
@@ -580,10 +579,12 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
         if price_val is None:
             continue
 
+        shipping_has_anchor = bool(entry.get("shippingHasAnchor"))
         shipping_text = entry.get("shippingText") or ""
-        shipping_val = _parse_shipping_text(shipping_text)
-        if shipping_val is None:
-            shipping_val = _parse_shipping_text(entry.get("priceContext"))
+        if shipping_has_anchor:
+            shipping_val = 0.0
+        else:
+            shipping_val = _parse_shipping_text(shipping_text)
         if shipping_val is None:
             shipping_val = 0.0
 
