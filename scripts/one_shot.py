@@ -1132,9 +1132,19 @@ def fetch_pages_in_product(product_id: str) -> dict:
             context.close(); browser.close()
 
 def fetch_active_listings_in_page(product_id: str, target_page: int) -> dict:
-    """Fetch active listings from a specific page number using optimized navigation."""
+    """Fetch active listings from a specific page number by directly navigating to the page URL."""
     t0 = time.time()
-    url = f"https://www.tcgplayer.com/product/{product_id}"
+
+    # Validate target page
+    if target_page < 1:
+        return {"product_id": str(product_id), "target_page": target_page,
+                "listings": [], "error": "invalid_page_number", "reason": "Page number must be >= 1",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "elapsed_ms": int((time.time() - t0) * 1000)}
+
+    # Build URL with page parameter
+    url = f"https://www.tcgplayer.com/product/{product_id}?page={target_page}"
+
     with sync_playwright() as p:
         browser, context = _new_context(p, use_saved_state=True)
         login_info = _ensure_logged_in(context)
@@ -1173,16 +1183,10 @@ def fetch_active_listings_in_page(product_id: str, target_page: int) -> dict:
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "elapsed_ms": int((time.time() - t0) * 1000)}
 
-            # Get the last page number
+            # Get the last page number to validate
             last_page = _extract_last_page_number(page)
 
-            # Validate target page
-            if target_page < 1:
-                return {"product_id": str(product_id), "url": page.url, "target_page": target_page,
-                        "listings": [], "error": "invalid_page_number", "reason": "Page number must be >= 1",
-                        "login": login_info, "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "elapsed_ms": int((time.time() - t0) * 1000)}
-
+            # Check if target page exceeds available pages
             if target_page > last_page:
                 return {"product_id": str(product_id), "url": page.url, "target_page": target_page,
                         "listings": [], "error": "page_out_of_range",
@@ -1191,27 +1195,8 @@ def fetch_active_listings_in_page(product_id: str, target_page: int) -> dict:
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "elapsed_ms": int((time.time() - t0) * 1000)}
 
-            # Navigate to target page using optimized navigation
-            if not _navigate_to_page_number(page, url, target_page, last_page):
-                art = _save_debug(page, "listings-page-navigation-failed")
-                return {"product_id": str(product_id), "url": page.url, "target_page": target_page,
-                        "listings": [], "error": "navigation_failed",
-                        "reason": f"Failed to navigate to page {target_page}",
-                        "login": login_info, "artifacts": art,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "elapsed_ms": int((time.time() - t0) * 1000)}
-
             # Verify we're on the correct page
             current_page = _detect_current_page(page)
-            if current_page != target_page:
-                art = _save_debug(page, "listings-page-mismatch")
-                return {"product_id": str(product_id), "url": page.url, "target_page": target_page,
-                        "current_page": current_page, "listings": [],
-                        "error": "page_mismatch",
-                        "reason": f"Navigated to page {current_page} instead of {target_page}",
-                        "login": login_info, "artifacts": art,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "elapsed_ms": int((time.time() - t0) * 1000)}
 
             # Scrape listings from current page
             page_listings = _scrape_active_listings_from_dom(page)
