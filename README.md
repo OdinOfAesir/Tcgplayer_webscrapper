@@ -56,6 +56,46 @@ Edit `configs/config.yaml` to customize:
    python scripts/tcgplayer_last_sold_monitor.py
    ```
 
+## REST API
+
+- `POST /last-sold`: Extracts the most recent sale for a given listing URL.
+- `POST /sales-snapshot`: Captures the sales history snapshot dialog for a product page.
+- `POST /active-listings`: Returns every active listing for a product ID, paginating through all result pages.
+
+### Active Listings Endpoint
+
+1. **Start the FastAPI app** (for local development):
+   ```bash
+   uvicorn app:app --reload
+   ```
+2. **Call the endpoint** with the product ID you want to inspect:
+   ```bash
+   curl -X POST http://127.0.0.1:8000/active-listings \
+     -H "Content-Type: application/json" \
+     -d '{"productId": "12345"}'
+   ```
+3. **Response payload**:
+   ```json
+   {
+     "product_id": "12345",
+     "url": "https://www.tcgplayer.com/...",
+     "listings": [
+       {
+         "condition": "Near Mint",
+         "price": 12.5,
+         "shippingPrice": 0.99,
+         "sellerName": "Example Seller",
+         "quantityAvailable": 4,
+         "additionalInfo": null
+       }
+     ],
+     "pages_scanned": 2,
+     "timestamp": "...",
+     "elapsed_ms": 4210
+   }
+   ```
+   Each listing reflects the condition, price, shipping cost, seller name, available quantity, and any extra notes. Shipping defaults to `0.0` when the page does not provide a value.
+
 ## Architecture
 
 - **Data Classes**: `LastSoldRecord` for type-safe data handling

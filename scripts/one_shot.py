@@ -7,7 +7,7 @@ import pathlib
 import uuid
 import json
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -47,6 +47,8 @@ USER_AGENT       = os.getenv("USER_AGENT") or (
 )
 NAV_PLATFORM = os.getenv("NAV_PLATFORM", "MacIntel")
 NAV_LANGS    = os.getenv("NAV_LANGS", "en-US,en")
+MAX_LISTING_PAGES   = _env_int("LISTING_MAX_PAGES", 20)
+LISTING_PAGE_WAIT_MS = _env_int("LISTING_PAGE_WAIT_MS", 20000)
 
 # ---------- proxy ----------
 def _parse_proxy_env():
@@ -405,6 +407,288 @@ def _extract_key_values_from_dialog_html(html: str) -> List[Dict[str, str]]:
                 out.append({"label": label.strip(), "value": value.strip()})
     return out
 
+def _parse_shipping_text(text: Optional[str]) -> Optional[float]:
+    if not text:
+        return None
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    if "free" in lowered:
+        return 0.0
+    return _to_money_float(cleaned)
+
+def _parse_quantity_text(text: Optional[str]) -> Optional[int]:
+    if not text:
+        return None
+    try:
+        match = re.search(r"\d+", text.replace(",", ""))
+        if not match:
+            return None
+        return int(match.group(0))
+    except Exception:
+        return None
+
+def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
+    try:
+        raw_listings = page.evaluate(
+            """
+            () => {
+                const container = document.querySelector('.product-details__listings');
+                if (!container) {
+                    return [];
+                }
+                const records = [];
+                const seenKeys = new Set();
+
+                const resolveRoot = (el) => {
+                    if (!el) {
+                        return null;
+                    }
+                    const root = el.closest('[data-testid="listing-item"], [data-testid="listing-card"], li, article, .listing-item, .product-listing, .product-details__listing');
+                    return root || el.parentElement;
+                };
+
+                const findShipping = (priceEl) => {
+                    if (!priceEl) {
+                        return null;
+                    }
+                    let sibling = priceEl.nextSibling;
+                    while (sibling) {
+                        if (sibling.nodeType === Node.TEXT_NODE) {
+                            sibling = sibling.nextSibling;
+                            continue;
+                        }
+                        if (sibling.nodeType === Node.ELEMENT_NODE) {
+                            const element = sibling;
+                            if (element.tagName && element.tagName.toLowerCase() === 'span') {
+                                if (!element.className || element.className.toLowerCase().includes('shipping')) {
+                                    return element;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    const parent = priceEl.parentElement;
+                    if (parent) {
+                        const candidates = parent.querySelectorAll('span:not([class]), span[class*="shipping"], span[class*="Shipping"]');
+                        for (const cand of candidates) {
+                            if (cand !== priceEl) {
+                                return cand;
+                            }
+                        }
+                    }
+                    return null;
+                };
+
+                const priceNodes = Array.from(container.querySelectorAll('.listing-item__listing-data__info__price'));
+                for (const priceEl of priceNodes) {
+                    const root = resolveRoot(priceEl);
+                    if (!root) {
+                        continue;
+                    }
+                    const key = root.getAttribute('data-listingid') ||
+                                root.getAttribute('data-sku') ||
+                                root.getAttribute('data-id') ||
+                                priceEl.getAttribute('data-sku-id') ||
+                                priceEl.getAttribute('data-store-sku') ||
+                                (root.id ? `id:${root.id}` : null) ||
+                                priceEl.outerHTML.slice(0, 180);
+                    if (seenKeys.has(key)) {
+                        continue;
+                    }
+                    seenKeys.add(key);
+                    const conditionEl = root.querySelector('.listing-item__listing-data__info__condition');
+                    const shippingEl = findShipping(priceEl);
+                    const quantityEl = root.querySelector('.add-to-cart__available');
+                    const additionalInfoEl = root.querySelector('.listing-item__listing-data__listo');
+                    const sellerEl = root.querySelector('.seller-info a');
+                    records.push({
+                        key,
+                        condition: conditionEl ? conditionEl.textContent.trim() : null,
+                        priceText: priceEl.textContent.trim(),
+                        priceContext: priceEl.parentElement ? priceEl.parentElement.textContent.trim() : priceEl.textContent.trim(),
+                        shippingText: shippingEl ? shippingEl.textContent.trim() : null,
+                        sellerName: sellerEl ? sellerEl.textContent.trim() : null,
+                        quantityText: quantityEl ? quantityEl.textContent.trim() : null,
+                        additionalInfo: additionalInfoEl ? additionalInfoEl.textContent.trim() : null
+                    });
+                }
+
+                if (!priceNodes.length) {
+                    const candidates = Array.from(container.querySelectorAll('[data-testid="listing-item"], [data-testid="listing-card"], .listing-item, li, article'));
+                    for (const node of candidates) {
+                        const priceEl = node.querySelector('.listing-item__listing-data__info__price');
+                        if (!priceEl) {
+                            continue;
+                        }
+                        const key = node.getAttribute('data-listingid') ||
+                                    node.getAttribute('data-sku') ||
+                                    node.getAttribute('data-id') ||
+                                    priceEl.getAttribute('data-sku-id') ||
+                                    priceEl.getAttribute('data-store-sku') ||
+                                    (node.id ? `id:${node.id}` : null) ||
+                                    node.outerHTML.slice(0, 180);
+                        if (seenKeys.has(key)) {
+                            continue;
+                        }
+                        seenKeys.add(key);
+                        const conditionEl = node.querySelector('.listing-item__listing-data__info__condition');
+                        const shippingEl = priceEl.nextElementSibling && priceEl.nextElementSibling.tagName && priceEl.nextElementSibling.tagName.toLowerCase() === 'span'
+                            ? priceEl.nextElementSibling
+                            : null;
+                        const quantityEl = node.querySelector('.add-to-cart__available');
+                        const additionalInfoEl = node.querySelector('.listing-item__listing-data__listo');
+                        const sellerEl = node.querySelector('.seller-info a');
+                        records.push({
+                            key,
+                            condition: conditionEl ? conditionEl.textContent.trim() : null,
+                            priceText: priceEl.textContent.trim(),
+                            priceContext: priceEl.parentElement ? priceEl.parentElement.textContent.trim() : priceEl.textContent.trim(),
+                            shippingText: shippingEl ? shippingEl.textContent.trim() : null,
+                            sellerName: sellerEl ? sellerEl.textContent.trim() : null,
+                            quantityText: quantityEl ? quantityEl.textContent.trim() : null,
+                            additionalInfo: additionalInfoEl ? additionalInfoEl.textContent.trim() : null
+                        });
+                    }
+                }
+
+                return records;
+            }
+            """
+        )
+    except Exception:
+        return []
+
+    processed: List[Dict[str, Any]] = []
+    seen_keys: Set[str] = set()
+    for entry in raw_listings or []:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        if not key:
+            key = f"listing-{len(processed)}"
+        key = str(key)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        price_val = _to_money_float(entry.get("priceText") or "")
+        if price_val is None:
+            price_val = _to_money_float(entry.get("priceContext") or "")
+        if price_val is None:
+            continue
+
+        shipping_text = entry.get("shippingText") or ""
+        shipping_val = _parse_shipping_text(shipping_text)
+        if shipping_val is None:
+            shipping_val = _parse_shipping_text(entry.get("priceContext"))
+        if shipping_val is None:
+            shipping_val = 0.0
+
+        quantity_val = _parse_quantity_text(entry.get("quantityText"))
+
+        condition_text = (entry.get("condition") or "").strip()
+        if not condition_text:
+            condition_text = "Unknown Condition"
+
+        seller_name = (entry.get("sellerName") or "").strip()
+        additional_info = entry.get("additionalInfo")
+        if additional_info is not None:
+            additional_info = additional_info.strip()
+            if not additional_info:
+                additional_info = None
+
+        processed.append({
+            "_key": key,
+            "condition": condition_text,
+            "price": round(price_val, 2),
+            "shippingPrice": round(shipping_val, 2) if shipping_val is not None else 0.0,
+            "sellerName": seller_name,
+            "quantityAvailable": quantity_val if quantity_val is not None else 0,
+            "additionalInfo": additional_info
+        })
+
+    return processed
+
+def _go_to_next_listings_page(page: Page) -> bool:
+    selectors = [
+        '.tcg-pagination.search-pagination a[aria-label*="Next"]:not([aria-disabled="true"])',
+        '.tcg-pagination.search-pagination button[aria-label*="Next"]:not([disabled])',
+        '.tcg-pagination.search-pagination a:has-text("Next")',
+        '.tcg-pagination.search-pagination button:has-text("Next")',
+        '.tcg-pagination.search-pagination li.next a:not(.disabled)',
+        'button:has-text("Load More")',
+        '[data-testid*="load-more"]',
+        'button:has-text("Show More")'
+    ]
+    try:
+        prev_html = page.evaluate(
+            "() => { const el = document.querySelector('.product-details__listings'); return el ? el.innerHTML : null; }"
+        )
+    except Exception:
+        prev_html = None
+
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+        except Exception:
+            continue
+        try:
+            if not loc or not loc.is_visible():
+                continue
+        except Exception:
+            continue
+
+        disabled_attr = ""
+        class_attr = ""
+        try:
+            disabled_attr = (loc.get_attribute("aria-disabled") or "").lower()
+            class_attr = (loc.get_attribute("class") or "").lower()
+        except Exception:
+            pass
+        if disabled_attr in ("true", "1"):
+            continue
+        if "disabled" in class_attr:
+            continue
+        try:
+            if hasattr(loc, "is_enabled") and not loc.is_enabled():
+                continue
+        except Exception:
+            pass
+
+        try:
+            loc.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+
+        try:
+            loc.click(timeout=3000)
+        except Exception:
+            continue
+
+        waited = False
+        if prev_html is not None:
+            try:
+                page.wait_for_function(
+                    "(arg) => { const el = document.querySelector(arg.selector); if (!el) { return false; } return el.innerHTML !== arg.prev; }",
+                    {"selector": ".product-details__listings", "prev": prev_html},
+                    timeout=LISTING_PAGE_WAIT_MS
+                )
+                waited = True
+            except Exception:
+                pass
+
+        if not waited:
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(15000, NAV_TIMEOUT_MS))
+            except Exception:
+                pass
+            page.wait_for_timeout(800)
+        return True
+
+    return False
+
 def _open_snapshot_dialog(page: Page, wait_ms: int) -> None:
     _slow_scroll(page, steps=14)
     try:
@@ -559,6 +843,98 @@ def fetch_sales_snapshot(url: str) -> dict:
                     "text": dialog_text.strip() if dialog_text else None,
                     "login": login_info, "timestamp": datetime.now(timezone.utc).isoformat(),
                     "elapsed_ms": int((time.time() - t0) * 1000)}
+        finally:
+            context.close(); browser.close()
+
+def fetch_active_listings(product_id: str) -> dict:
+    t0 = time.time()
+    url = f"https://www.tcgplayer.com/product/{product_id}"
+    with sync_playwright() as p:
+        browser, context = _new_context(p, use_saved_state=True)
+        login_info = _ensure_logged_in(context)
+        page = context.new_page()
+        try:
+            try:
+                _goto_with_retries(page, url); _click_consent_if_present(page)
+            except Exception as e:
+                art = _save_debug(page, "listings-nav-failed")
+                return {"product_id": str(product_id), "url": url, "listings": [],
+                        "error": "timeout_nav", "reason": str(e), "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            if not _is_logged_in(page) and not FORCE_STATE_ONLY and os.getenv("TCG_EMAIL") and os.getenv("TCG_PASSWORD"):
+                li2 = _do_login_flow(context, capture=True)
+                login_info = {"first": login_info, "retry": li2}
+                page = context.new_page(); _goto_with_retries(page, url); _click_consent_if_present(page)
+
+            err = _anti_bot_check(page)
+            if err:
+                art = _save_debug(page, "listings-challenge")
+                return {"product_id": str(product_id), "url": url, "listings": [],
+                        "error": err, "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            try:
+                page.wait_for_selector(".product-details__listings", timeout=LISTING_PAGE_WAIT_MS)
+            except Exception as e:
+                art = _save_debug(page, "listings-container-missing")
+                return {"product_id": str(product_id), "url": page.url,
+                        "listings": [], "error": "listings_container_not_found", "reason": str(e),
+                        "login": login_info, "artifacts": art,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_ms": int((time.time() - t0) * 1000)}
+
+            aggregated: List[Dict[str, Any]] = []
+            seen_listing_keys: Set[str] = set()
+            seen_signatures: Set[str] = set()
+            pages_inspected = 0
+
+            while pages_inspected < MAX_LISTING_PAGES:
+                pages_inspected += 1
+                try:
+                    page.wait_for_selector(".product-details__listings", timeout=LISTING_PAGE_WAIT_MS)
+                except Exception:
+                    break
+
+                try:
+                    signature = page.evaluate(
+                        "() => { const el = document.querySelector('.product-details__listings'); return el ? el.innerHTML.slice(0, 4096) : null; }"
+                    )
+                except Exception:
+                    signature = None
+
+                if signature and signature in seen_signatures:
+                    break
+                if signature:
+                    seen_signatures.add(signature)
+
+                page_listings = _scrape_active_listings_from_dom(page)
+                for listing in page_listings:
+                    key = listing.pop("_key", None)
+                    dedup_key = key or f"{listing.get('sellerName','')}|{listing.get('condition','')}|{listing.get('price')}|{listing.get('quantityAvailable')}|{listing.get('additionalInfo')}"
+                    if dedup_key in seen_listing_keys:
+                        continue
+                    seen_listing_keys.add(dedup_key)
+                    aggregated.append(listing)
+
+                if not _go_to_next_listings_page(page):
+                    break
+                try:
+                    page.wait_for_timeout(600)
+                except Exception:
+                    pass
+
+            return {
+                "product_id": str(product_id),
+                "url": page.url,
+                "listings": aggregated,
+                "pages_scanned": pages_inspected,
+                "login": login_info,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "elapsed_ms": int((time.time() - t0) * 1000)
+            }
         finally:
             context.close(); browser.close()
 

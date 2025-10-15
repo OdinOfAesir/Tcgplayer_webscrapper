@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from scripts.one_shot import (
     fetch_last_sold_once,
     fetch_sales_snapshot,
+    fetch_active_listings,
     debug_login_only,
     debug_proxy_ip,
     debug_cookies,
@@ -47,6 +48,13 @@ def sales_snapshot(payload: dict):
     if not url:
         raise HTTPException(status_code=400, detail="Missing url")
     return JSONResponse(fetch_sales_snapshot(url))
+
+@app.post("/active-listings")
+def active_listings(payload: dict):
+    product_id = payload.get("productId") or payload.get("product_id")
+    if not product_id:
+        raise HTTPException(status_code=400, detail="Missing productId")
+    return JSONResponse(fetch_active_listings(str(product_id)))
 
 # ---- Debug / Diagnostics (PUBLIC in this build) ----
 
