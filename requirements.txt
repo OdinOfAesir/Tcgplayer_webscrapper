@@ -5,3 +5,4 @@ beautifulsoup4>=4.12.3
 lxml>=5.2.1
 # Keep this version MATCHED to the Docker image tag above
 playwright==1.55.0
+python-dotenv>=1.0.0

@@ -1,8 +1,12 @@
 # app.py
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 from scripts.one_shot import (
     fetch_last_sold_once,
@@ -21,6 +25,34 @@ from scripts.one_shot import (
 )
 
 app = FastAPI(title="tcgplayer-scraper", version="1.4.0-public")
+
+# ---- API Key Authentication ----
+API_KEY = os.getenv("API_KEY")
+
+if not API_KEY:
+    raise ValueError("API_KEY environment variable is not set. Please set it in your .env file.")
+
+@app.middleware("http")
+async def verify_api_key(request: Request, call_next):
+    """Verify API key for all requests except root endpoint."""
+    # Allow root endpoint without authentication for health checks
+    if request.url.path == "/":
+        return await call_next(request)
+
+    # Check for API key in headers
+    api_key = request.headers.get("X-API-Key") or request.headers.get("Authorization")
+
+    # Support Bearer token format
+    if api_key and api_key.startswith("Bearer "):
+        api_key = api_key[7:]
+
+    if api_key != API_KEY:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Invalid or missing API key. Include 'X-API-Key' header with your API key."}
+        )
+
+    return await call_next(request)
 
 # ---- CORS: allow all (public testing) ----
 app.add_middleware(
