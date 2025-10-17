@@ -430,6 +430,19 @@ def _parse_quantity_text(text: Optional[str]) -> Optional[int]:
     except Exception:
         return None
 
+def _extract_seller_id_from_href(href: Optional[str]) -> Optional[str]:
+    """Extract seller ID from href like https://shop.tcgplayer.com/sellerfeedback/{sellerID}"""
+    if not href:
+        return None
+    try:
+        # Match the text after the last "/"
+        match = re.search(r"/([^/]+)$", href.strip())
+        if match:
+            return match.group(1)
+        return None
+    except Exception:
+        return None
+
 def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
     try:
         raw_listings = page.evaluate(
@@ -511,6 +524,7 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
                         shippingText: shippingInfo.text,
                         shippingHasAnchor: shippingInfo.hasAnchor,
                         sellerName: sellerEl ? sellerEl.textContent.trim() : null,
+                        sellerHref: sellerEl ? sellerEl.getAttribute('href') : null,
                         quantityText: quantityEl ? quantityEl.textContent.trim() : null,
                         additionalInfo: extractAdditionalInfo(additionalInfoEl)
                     });
@@ -547,6 +561,7 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
                             shippingText: shippingInfo.text,
                             shippingHasAnchor: shippingInfo.hasAnchor,
                             sellerName: sellerEl ? sellerEl.textContent.trim() : null,
+                            sellerHref: sellerEl ? sellerEl.getAttribute('href') : null,
                             quantityText: quantityEl ? quantityEl.textContent.trim() : null,
                             additionalInfo: extractAdditionalInfo(additionalInfoEl)
                         });
@@ -595,6 +610,9 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
             condition_text = "Unknown Condition"
 
         seller_name = (entry.get("sellerName") or "").strip()
+        seller_href = entry.get("sellerHref")
+        seller_id = _extract_seller_id_from_href(seller_href)
+
         additional_info = entry.get("additionalInfo")
         if additional_info is not None:
             additional_info = additional_info.strip()
@@ -607,6 +625,7 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
             "price": round(price_val, 2),
             "shippingPrice": round(shipping_val, 2) if shipping_val is not None else 0.0,
             "sellerName": seller_name,
+            "sellerId": seller_id,
             "quantityAvailable": quantity_val if quantity_val is not None else 0,
             "additionalInfo": additional_info
         })
