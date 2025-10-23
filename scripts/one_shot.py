@@ -500,15 +500,20 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
                     if (!root) {
                         continue;
                     }
-                    const key = root.getAttribute('data-listingid') ||
-                                root.getAttribute('data-sku') ||
-                                root.getAttribute('data-id') ||
-                                priceEl.getAttribute('data-sku-id') ||
-                                priceEl.getAttribute('data-store-sku') ||
-                                (root.id ? `id:${root.id}` : null) ||
-                                priceEl.outerHTML.slice(0, 180);
+                    const baseKey = root.getAttribute('data-listingid') ||
+                                    root.getAttribute('data-sku') ||
+                                    root.getAttribute('data-id') ||
+                                    priceEl.getAttribute('data-sku-id') ||
+                                    priceEl.getAttribute('data-store-sku') ||
+                                    (root.id ? `id:${root.id}` : null) ||
+                                    priceEl.outerHTML.slice(0, 180);
+                    let key = baseKey || `listing-${records.length}`;
                     if (seenKeys.has(key)) {
-                        continue;
+                        let suffix = 2;
+                        while (seenKeys.has(`${key}#${suffix}`)) {
+                            suffix += 1;
+                        }
+                        key = `${key}#${suffix}`;
                     }
                     seenKeys.add(key);
                     const conditionEl = root.querySelector('.listing-item__listing-data__info__condition');
@@ -537,15 +542,20 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
                         if (!priceEl) {
                             continue;
                         }
-                        const key = node.getAttribute('data-listingid') ||
-                                    node.getAttribute('data-sku') ||
-                                    node.getAttribute('data-id') ||
-                                    priceEl.getAttribute('data-sku-id') ||
-                                    priceEl.getAttribute('data-store-sku') ||
-                                    (node.id ? `id:${node.id}` : null) ||
-                                    node.outerHTML.slice(0, 180);
+                        const baseKey = node.getAttribute('data-listingid') ||
+                                        node.getAttribute('data-sku') ||
+                                        node.getAttribute('data-id') ||
+                                        priceEl.getAttribute('data-sku-id') ||
+                                        priceEl.getAttribute('data-store-sku') ||
+                                        (node.id ? `id:${node.id}` : null) ||
+                                        node.outerHTML.slice(0, 180);
+                        let key = baseKey || `listing-${records.length}`;
                         if (seenKeys.has(key)) {
-                            continue;
+                            let suffix = 2;
+                            while (seenKeys.has(`${key}#${suffix}`)) {
+                                suffix += 1;
+                            }
+                            key = `${key}#${suffix}`;
                         }
                         seenKeys.add(key);
                         const conditionEl = node.querySelector('.listing-item__listing-data__info__condition');
@@ -577,7 +587,6 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
 
     processed: List[Dict[str, Any]] = []
     seen_keys: Set[str] = set()
-    seen_signatures: Set[tuple] = set()
     for idx, entry in enumerate(raw_listings or []):
         if not isinstance(entry, dict):
             continue
@@ -612,18 +621,6 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
             additional_info = additional_info.strip()
             if not additional_info:
                 additional_info = None
-
-        signature = (
-            (seller_id or seller_name or "").lower(),
-            condition_text.lower(),
-            round(price_val, 2),
-            round(shipping_val or 0.0, 2),
-            quantity_val if quantity_val is not None else 0,
-            (additional_info or "").lower(),
-        )
-        if signature in seen_signatures:
-            continue
-        seen_signatures.add(signature)
 
         raw_key = str(entry.get("key") or "").strip()
         fallback_key = "|".join([
