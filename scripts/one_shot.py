@@ -577,16 +577,10 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
 
     processed: List[Dict[str, Any]] = []
     seen_keys: Set[str] = set()
-    for entry in raw_listings or []:
+    seen_signatures: Set[tuple] = set()
+    for idx, entry in enumerate(raw_listings or []):
         if not isinstance(entry, dict):
             continue
-        key = entry.get("key")
-        if not key:
-            key = f"listing-{len(processed)}"
-        key = str(key)
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
 
         price_val = _to_money_float(entry.get("priceText") or "")
         if price_val is None:
@@ -609,9 +603,9 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
         if not condition_text:
             condition_text = "Unknown Condition"
 
-        seller_name = (entry.get("sellerName") or "").strip()
         seller_href = entry.get("sellerHref")
         seller_id = _extract_seller_id_from_href(seller_href)
+        seller_name = (entry.get("sellerName") or "").strip()
 
         additional_info = entry.get("additionalInfo")
         if additional_info is not None:
@@ -619,8 +613,37 @@ def _scrape_active_listings_from_dom(page: Page) -> List[Dict[str, Any]]:
             if not additional_info:
                 additional_info = None
 
+        signature = (
+            (seller_id or seller_name or "").lower(),
+            condition_text.lower(),
+            round(price_val, 2),
+            round(shipping_val or 0.0, 2),
+            quantity_val if quantity_val is not None else 0,
+            (additional_info or "").lower(),
+        )
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+
+        raw_key = str(entry.get("key") or "").strip()
+        fallback_key = "|".join([
+            seller_id or seller_name or "",
+            condition_text,
+            f"{price_val:.2f}",
+            f"{round(shipping_val or 0.0, 2):.2f}",
+            str(quantity_val if quantity_val is not None else 0),
+            additional_info or "",
+        ])
+        base_key = raw_key or fallback_key or f"listing-{idx}"
+        candidate_key = base_key
+        suffix = 1
+        while candidate_key in seen_keys:
+            suffix += 1
+            candidate_key = f"{base_key}#{suffix}"
+        seen_keys.add(candidate_key)
+
         processed.append({
-            "_key": key,
+            "_key": candidate_key,
             "condition": condition_text,
             "price": round(price_val, 2),
             "shippingPrice": round(shipping_val, 2) if shipping_val is not None else 0.0,
