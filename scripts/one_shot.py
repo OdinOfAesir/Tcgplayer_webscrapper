@@ -38,6 +38,17 @@ def _env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    trimmed = raw.strip().lower()
+    if trimmed in ("1", "true", "yes", "on"):
+        return True
+    if trimmed in ("0", "false", "no", "off"):
+        return False
+    return default
+
 NAV_TIMEOUT_MS   = _env_int("TIMEOUT_MS", 60000)
 SNAPSHOT_WAIT_MS = _env_int("SNAPSHOT_WAIT_MS", 45000)
 RETRY_TIMES      = _env_int("RETRY_TIMES", 3)
@@ -50,6 +61,7 @@ NAV_PLATFORM = os.getenv("NAV_PLATFORM", "MacIntel")
 NAV_LANGS    = os.getenv("NAV_LANGS", "en-US,en")
 MAX_LISTING_PAGES   = _env_int("LISTING_MAX_PAGES", 20)
 LISTING_PAGE_WAIT_MS = _env_int("LISTING_PAGE_WAIT_MS", 20000)
+BLOCK_IMAGES = _env_bool("BLOCK_IMAGES", True)
 
 # ---------- proxy ----------
 def _parse_proxy_env():
@@ -69,6 +81,8 @@ def _parse_proxy_env():
     return proxy
 
 # ---------- helpers ----------
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico")
+
 def _save_debug(page: Page, tag: str) -> Dict[str, str]:
     ts  = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     uid = uuid.uuid4().hex[:8]
@@ -153,7 +167,29 @@ def _new_context(p, use_saved_state: bool):
         Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
         window.chrome = window.chrome || {{ runtime: {{}} }};
     """)
+    _install_request_blocking(context)
     return browser, context
+
+def _install_request_blocking(context):
+    if not BLOCK_IMAGES:
+        return
+
+    blocked_types = {"image"}
+
+    def _should_block(url: str) -> bool:
+        path = url.split("?", 1)[0].lower()
+        return any(path.endswith(ext) for ext in _IMAGE_EXTENSIONS)
+
+    def handle(route, request):
+        try:
+            if request.resource_type in blocked_types or _should_block(request.url):
+                route.abort()
+                return
+        except Exception:
+            pass
+        route.continue_()
+
+    context.route("**/*", handle)
 
 def _anti_bot_check(page: Page) -> Optional[str]:
     title = (page.title() or "")
